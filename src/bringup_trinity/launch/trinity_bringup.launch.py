@@ -58,7 +58,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'enable_traffic_light',
-            default_value='true',
+            default_value='false',
             description='신호등(초록불 출발) 미션 On/Off',
         ),
         DeclareLaunchArgument(
@@ -104,17 +104,17 @@ def generate_launch_description():
     )
 
     # 3) 신호등 인지
-    traffic_light_node = Node(
-        package='obstacle_detection_package',
-        executable='traffic_light_perception_node',
-        name='traffic_light_perception_node',
-        output='screen',
-    )
+    # traffic_light_node = Node(
+    #     package='obstacle_detection_package',
+    #     executable='traffic_light_perception_node',
+    #     name='traffic_light_perception_node',
+    #     output='screen',
+    # )
 
     # 4) 차선 추종 (Stanley)
     stanley_node = Node(
         package='decision_making_package',
-        executable='stanley_follow',
+        executable='my_test_stanley',
         name='lane_follow',
         output='screen',
     )
@@ -138,7 +138,7 @@ def generate_launch_description():
     return LaunchDescription(declare_args + [
         yolo_node,
         fusion_node,
-        traffic_light_node,
+        # traffic_light_node,
         stanley_node,
         state_machine_node,
     ])

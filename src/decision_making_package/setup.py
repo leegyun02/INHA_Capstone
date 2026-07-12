@@ -30,6 +30,8 @@ setup(
             'test_state_machine = decision_making_package.test_state_machine:main',
             'final_test_state_machine = decision_making_package.final_test_state_machine:main',
             'my_test_stanley = decision_making_package.my_test_stanley:main',
+            'parallel_parking_node = decision_making_package.parallel_parking_node:main',
+            'cmd_vel_record_replay_node = decision_making_package.cmd_vel_record_replay_node:main',
         ],
     },
 )

@@ -46,7 +46,7 @@ TUNNEL_MIN_POINTS    = 2     # 벽 클러스터 최소 점 개수
 TUNNEL_BRIDGE_GAP    = 3     # 무효빔 브리징 허용
 
 # --- RViz 마커 ---
-PUBLISH_DEBUG    = True      # 마커 발행 on/off
+PUBLISH_DEBUG    = False     # 마커 발행 on/off
 MARKER_LIFETIME  = 0.2       # 마커 유지 시간 [s]
 MARKER_DIAMETER  = 0.3       # 실린더 지름 [m]
 
