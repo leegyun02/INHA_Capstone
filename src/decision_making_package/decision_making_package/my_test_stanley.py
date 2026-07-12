@@ -62,13 +62,9 @@ class LaneFollow(Node):
 
         # ===== LAST_CURVE 전용 =====
         self.declare_parameter('last_curve_max_speed', 0.7)              # 속도 상한
-        self.declare_parameter('last_curve_gap_thresh_px', 230.0)        # 2차선 간격: 미만이면 좁음
-        self.declare_parameter('last_curve_lane_width_px', 200.0)        # 단일차선 시 가상 반대차선 간격
-        self.declare_parameter('last_curve_single_lane_pos_angle_deg', 7.0)  # |각도|<이 값이면 최하단 x위치로 좌/우 판정
-        self.declare_parameter('last_curve_drop_angle_deg', 10.0)        # 이 각도 이상 우측기울이면 차선 삭제
 
         # ===== LAST_LANE 진입 트리거 (가로 정지선 감지, BEV 이진화 이미지 기반) =====
-        self.declare_parameter('stopline_row_ratio_thresh', 0.5)   # 한 행이 이 비율 이상 흰 픽셀이면 "가로줄"로 카운트
+        self.declare_parameter('stopline_row_ratio_thresh', 0.4)   # 한 행이 이 비율 이상 흰 픽셀이면 "가로줄"로 카운트
         self.declare_parameter('stopline_min_rows', 3)              # 가로줄로 카운트된 행이 이만큼 있어야 후보로 인정
         self.declare_parameter('stopline_confirm_frames', 1)        # 이 프레임 연속 후보여야 최종 확정(latch)
         self.declare_parameter('last_lane_speed', 0.3)              # 확정 후 속도 상한 (last_curve_max_speed보다 우선)
@@ -108,10 +104,6 @@ class LaneFollow(Node):
         self.car_follow_drop_angle_deg = float(self.get_parameter('car_follow_drop_angle_deg').value)
 
         self.last_curve_max_speed = float(self.get_parameter('last_curve_max_speed').value)
-        self.last_curve_gap_thresh_px = float(self.get_parameter('last_curve_gap_thresh_px').value)
-        self.last_curve_lane_width_px = float(self.get_parameter('last_curve_lane_width_px').value)
-        self.last_curve_single_lane_pos_angle_deg = float(self.get_parameter('last_curve_single_lane_pos_angle_deg').value)
-        self.last_curve_drop_angle_deg = float(self.get_parameter('last_curve_drop_angle_deg').value)
 
         self.stopline_row_ratio_thresh = float(self.get_parameter('stopline_row_ratio_thresh').value)
         self.stopline_min_rows = int(self.get_parameter('stopline_min_rows').value)
@@ -491,62 +483,6 @@ class LaneFollow(Node):
         return self._default_lane(img_w, self.car_follow_lane_width_px)
 
     # ============================================================
-    #  LAST_CURVE 차선 선택
-    #    2개: 좁으면 화면상 왼쪽 / 넓으면 오른쪽 -> 1개로 축약
-    #    1개: |각도|<pos -> 최하단 x위치, 우측 급기울 -> 삭제, 그 외 -> 오른쪽
-    # ============================================================
-    def _last_curve_lane_select(self, candidates, img_h, img):
-        img_w = img.shape[1]
-        width = self.last_curve_lane_width_px
-
-        if len(candidates) == 2:
-            fit_a = np.asarray(candidates[0][0], dtype=float)
-            fit_b = np.asarray(candidates[1][0], dtype=float)
-            gap = self.fit_distance(fit_a, fit_b, img_h)
-            compare_y = (img_h - 1) * 0.80
-            xa = self.fit_x(fit_a, [compare_y])[0]
-            xb = self.fit_x(fit_b, [compare_y])[0]
-
-            if gap < self.last_curve_gap_thresh_px:
-                keep = candidates[0] if xa <= xb else candidates[1]
-                self.special_lane_debug = f'2->1 narrow gap={gap:.0f} keep left-pos'
-            else:
-                keep = candidates[0] if xa >= xb else candidates[1]
-                self.special_lane_debug = f'2->1 wide gap={gap:.0f} keep right'
-            candidates = [keep]
-
-        if len(candidates) == 1:
-            candidate = np.asarray(candidates[0][0], dtype=float)
-            angle_deg = self.fit_angle_deg(candidate)
-
-            if abs(angle_deg) < self.last_curve_single_lane_pos_angle_deg:
-                x_bottom = float(self.fit_x(candidate, [img_h - 1])[0])
-                side = 'left' if x_bottom < img_w / 2.0 else 'right'
-                lfit, rfit = self.update_single_lane_track(candidate, side, width)
-                self.last_lane_status = f'last_curve_{side}'
-                self.special_lane_debug += f' | POS {side} x={x_bottom:.0f}'
-                return lfit, rfit
-            if angle_deg <= -self.last_curve_drop_angle_deg:
-                self.special_lane_debug += f' | DROP right {angle_deg:.1f}deg'
-            else:
-                lfit, rfit = self.update_single_lane_track(candidate, 'right', width)
-                self.last_lane_status = 'last_curve_right'
-                self.special_lane_debug += f' | SET right {angle_deg:.1f}deg'
-                return lfit, rfit
-
-        # 차선 없음 -> 이전 값 유지, 없으면 직진
-        if self.prev_lfit is not None and self.prev_rfit is not None:
-            self.last_lane_status = 'last_curve_hold'
-            if self.special_lane_debug == 'off':
-                self.special_lane_debug = 'no lane -> hold'
-            return self.prev_lfit.copy(), self.prev_rfit.copy()
-
-        self.last_lane_status = 'last_curve_straight'
-        if self.special_lane_debug == 'off':
-            self.special_lane_debug = 'no lane -> straight'
-        return self._default_lane(img_w, width)
-
-    # ============================================================
     #  NORMAL 차선 선택
     # ============================================================
     def _normal_lane_select(self, candidates, img_h, img_w):
@@ -671,8 +607,6 @@ class LaneFollow(Node):
 
         if self.behavior_phase == 'CAR_FOLLOW':
             lfit, rfit = self._car_follow_lane_select(candidates, y, img)
-        elif self.behavior_phase == 'LAST_CURVE':
-            lfit, rfit = self._last_curve_lane_select(candidates, y, img)
         else:
             lfit, rfit = self._normal_lane_select(candidates, y, img.shape[1])
 
@@ -693,7 +627,8 @@ class LaneFollow(Node):
     # ============================================================
     #  디버그 오버레이
     # ============================================================
-    def draw_lane(self, image, warp_roi, warp_img0, inv_mat, left_fit, right_fit):
+    def draw_lane(self, image, warp_roi, warp_img0, inv_mat, left_fit, right_fit,
+                  tophat_removed=None):
         base_warp = warp_img0 if warp_img0 is not None else warp_roi
         full_h = base_warp.shape[0]
         roi_h = warp_roi.shape[0]
@@ -715,6 +650,14 @@ class LaneFollow(Node):
 
         newwarp = cv.warpPerspective(color_warp, inv_mat, (image.shape[1], image.shape[0]))
         result = cv.addWeighted(image, 1, newwarp, 0.3, 0)
+
+        # tophat이 제거한 픽셀을 원래 자리(원본 영상 좌표)에 빨간색으로 표시
+        if tophat_removed is not None:
+            removed_full = np.zeros(base_warp.shape[:2], dtype=np.uint8)
+            removed_full[roi_offset_y:roi_offset_y + roi_h, :] = tophat_removed
+            removed_unwarp = cv.warpPerspective(removed_full, inv_mat,
+                                                (image.shape[1], image.shape[0]))
+            result[removed_unwarp > 0] = (0, 0, 255)
 
         steer_deg = math.degrees(self.steer)
         cv.putText(result, f'yaw: {self.yaw:.3f} rad / steer: {steer_deg:.1f} deg / ang_z: {self.angular_velocity:.2f}',
@@ -768,8 +711,13 @@ class LaneFollow(Node):
         self.roi_img_pub.publish(self.cv_bridge.cv2_to_imgmsg(self.warp_img0, encoding='bgr8'))
 
         hsv_binary = self.binary_filter(self.white_color_filter_hsv(g_filtered))
-        if self.tophat_enable:
-            self.filtered_img = cv.bitwise_and(hsv_binary, self.tophat_filter(g_filtered))
+        tophat_removed = None
+        # LAST_CURVE 구간에서는 tophat 로직을 적용하지 않음
+        if self.tophat_enable and self.behavior_phase != 'LAST_CURVE':
+            tophat_mask = self.tophat_filter(g_filtered)
+            self.filtered_img = cv.bitwise_and(hsv_binary, tophat_mask)
+            # tophat으로 인해 지워진 픽셀(원래 흰색이었으나 tophat이 제거한 자리)
+            tophat_removed = cv.bitwise_and(hsv_binary, cv.bitwise_not(tophat_mask))
         else:
             self.filtered_img = hsv_binary
         self.binary_img_pub.publish(self.cv_bridge.cv2_to_imgmsg(self.filtered_img, encoding='mono8'))
@@ -779,7 +727,8 @@ class LaneFollow(Node):
         self.yaw, self.error = self.cal_center_line(lfit, rfit)
         self.cal_steering(self.yaw, self.error)
 
-        debug2_img = self.draw_lane(self.bgr, warp_roi, self.warp_img0, self.inv_warp_mat, lfit, rfit)
+        debug2_img = self.draw_lane(self.bgr, warp_roi, self.warp_img0, self.inv_warp_mat, lfit, rfit,
+                                    tophat_removed=tophat_removed)
         self.debug_publisher2.publish(self.cv_bridge.cv2_to_imgmsg(debug2_img, encoding='bgr8'))
 
 

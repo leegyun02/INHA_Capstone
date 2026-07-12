@@ -107,7 +107,7 @@ class CmdVelRecordReplayNode(Node):
         self.declare_parameter('record_source', 'cmd_vel')  # 'cmd_vel' or 'odom'
         self.record_source = self.get_parameter('record_source').value
 
-        self.declare_parameter('replay_speed_scale', 1.0)  # 1.0=녹화 그대로, 2.0=전환 2배 빠르게, 0.5=절반 느리게
+        self.declare_parameter('replay_speed_scale', 1.0)  # 1.0=녹화 그대로, 2.0=같은 경로 2배 빠르게, 0.5=절반 느리게 (시간+속도 동시 스케일)
         self.replay_speed_scale = float(self.get_parameter('replay_speed_scale').value)
 
         self.declare_parameter('record_fixed_dt', RECORD_FIXED_DT)
@@ -332,8 +332,10 @@ class CmdVelRecordReplayNode(Node):
 
         _, vx, wz = self.records[self.replay_index]
         out = Twist()
-        out.linear.x = vx
-        out.angular.z = wz
+        # 시간 압축(replay_elapsed)과 동일 배율로 속도도 올려야 궤적이 보존된 채 배속 재생됨.
+        # (속도 배율 없이 시간만 압축하면 같은 명령을 짧게 유지 -> 이동량이 줄어 경로가 축소됨)
+        out.linear.x = vx * self.replay_speed_scale
+        out.angular.z = wz * self.replay_speed_scale
         self.cmd_pub.publish(out)
 
     # ============================================================
