@@ -30,7 +30,7 @@ class LaneFollow(Node):
         self.declare_parameter('white_lower', [0, 0, 190])
         self.declare_parameter('white_upper', [180, 20, 255])
         self.declare_parameter('tophat_enable', True)
-        self.declare_parameter('tophat_kernel_size', 31)
+        self.declare_parameter('tophat_kernel_size', 40)
         self.declare_parameter('tophat_thresh', 30)
         self.declare_parameter('min_lane_pixels', 30)
 
@@ -61,7 +61,7 @@ class LaneFollow(Node):
         self.declare_parameter('car_follow_drop_angle_deg', 10.0)        # 이 각도 이상 우측기울이면 차선 삭제
 
         # ===== LAST_CURVE 전용 =====
-        self.declare_parameter('last_curve_max_speed', 0.7)              # 속도 상한
+        self.declare_parameter('last_curve_max_speed', 0.8)              # 속도 상한
 
         # ===== LAST_LANE 진입 트리거 (가로 정지선 감지, BEV 이진화 이미지 기반) =====
         self.declare_parameter('stopline_row_ratio_thresh', 0.4)   # 한 행이 이 비율 이상 흰 픽셀이면 "가로줄"로 카운트

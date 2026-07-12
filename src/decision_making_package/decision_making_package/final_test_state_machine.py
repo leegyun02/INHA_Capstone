@@ -60,9 +60,9 @@ PERSON_PASS_SEC     = 5.0
 
 # --- Car 추종 (속도 캡) ---
 CAR_GATE_LAT        = 0.6
-CAR_STOP_DIST       = 0.40
-CAR_RESUME_DIST     = 0.55
-CAR_MID_DIST        = 0.80
+CAR_STOP_DIST       = 0.25
+CAR_RESUME_DIST     = 0.4
+CAR_MID_DIST        = 0.60
 CAR_CRUISE_DIST     = 1.50
 CAR_MID_SPEED       = 0.5
 CAR_MAX_CAP         = 1.0
