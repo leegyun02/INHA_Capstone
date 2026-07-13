@@ -30,9 +30,14 @@ class LaneFollow(Node):
         self.declare_parameter('white_lower', [0, 0, 190])
         self.declare_parameter('white_upper', [180, 20, 255])
         self.declare_parameter('tophat_enable', True)
-        self.declare_parameter('tophat_kernel_size', 40)
+        self.declare_parameter('tophat_kernel_size', 35)
         self.declare_parameter('tophat_thresh', 30)
         self.declare_parameter('min_lane_pixels', 30)
+        # base 탐색: 안쪽(중앙)부터 바깥으로 스캔해 임계값 넘는 첫 피크를 차선 base로 선택
+        self.declare_parameter('inner_base_search', True)      # False면 기존 argmax 방식
+        self.declare_parameter('base_peak_ratio', 0.5)         # 각 절반 최댓값 대비 피크 인정 비율
+        self.declare_parameter('base_min_sum', 1500.0)         # 히스토그램 열 합 절대 하한(≈6px)
+        self.declare_parameter('base_peak_margin', 15)         # 선택 피크 중심 보정 반경(px)
 
         # ===== 제어 (Stanley / 속도) =====
         self.declare_parameter('steer_k', 0.002)
@@ -54,9 +59,11 @@ class LaneFollow(Node):
 
         # ===== CAR_FOLLOW(로터리) 전용 =====
         self.declare_parameter('car_follow_hold_sec', 5.0)               # phase 이탈 후 유지 시간
-        self.declare_parameter('car_follow_max_speed', 0.7)              # 속도 상한
-        self.declare_parameter('car_follow_gap_thresh_px', 230.0)        # 2차선 간격: 미만이면 좁음
-        self.declare_parameter('car_follow_lane_width_px', 150.0)        # 단일차선 시 가상 반대차선 간격
+        self.declare_parameter('car_follow_max_speed', 1.0)              # 속도 상한
+        self.declare_parameter('car_follow_gap_thresh_px', 250.0)        # 2차선 간격: 미만이면 좁음
+        self.declare_parameter('car_follow_lane_width_px', 150.0)        # 차선 미검출(직진 폴백) 시 가상 차폭
+        self.declare_parameter('car_follow_lane_width_left_px',450.0)   # 왼쪽 차선만 검출 시 가상 우측차선 오프셋(차폭)
+        self.declare_parameter('car_follow_lane_width_right_px', 150.0)  # 오른쪽 차선만 검출 시 가상 좌측차선 오프셋(차폭)
         self.declare_parameter('car_follow_single_lane_pos_angle_deg', 7.0)  # |각도|<이 값이면 최하단 x위치로 좌/우 판정
         self.declare_parameter('car_follow_drop_angle_deg', 10.0)        # 이 각도 이상 우측기울이면 차선 삭제
 
@@ -80,6 +87,10 @@ class LaneFollow(Node):
         self.tophat_kernel_size = int(self.get_parameter('tophat_kernel_size').value)
         self.tophat_thresh = int(self.get_parameter('tophat_thresh').value)
         self.min_lane_pixels = int(self.get_parameter('min_lane_pixels').value)
+        self.inner_base_search = bool(self.get_parameter('inner_base_search').value)
+        self.base_peak_ratio = float(self.get_parameter('base_peak_ratio').value)
+        self.base_min_sum = float(self.get_parameter('base_min_sum').value)
+        self.base_peak_margin = int(self.get_parameter('base_peak_margin').value)
 
         self.steer_k = float(self.get_parameter('steer_k').value)
         self.yaw_k = float(self.get_parameter('yaw_k').value)
@@ -100,6 +111,8 @@ class LaneFollow(Node):
         self.car_follow_max_speed = float(self.get_parameter('car_follow_max_speed').value)
         self.car_follow_gap_thresh_px = float(self.get_parameter('car_follow_gap_thresh_px').value)
         self.car_follow_lane_width_px = float(self.get_parameter('car_follow_lane_width_px').value)
+        self.car_follow_lane_width_left_px = float(self.get_parameter('car_follow_lane_width_left_px').value)
+        self.car_follow_lane_width_right_px = float(self.get_parameter('car_follow_lane_width_right_px').value)
         self.car_follow_single_lane_pos_angle_deg = float(self.get_parameter('car_follow_single_lane_pos_angle_deg').value)
         self.car_follow_drop_angle_deg = float(self.get_parameter('car_follow_drop_angle_deg').value)
 
@@ -432,6 +445,12 @@ class LaneFollow(Node):
     #    2개: 좁으면 화면상 왼쪽 / 넓으면 오른쪽 -> 1개로 축약
     #    1개: |각도|<pos -> 최하단 x위치, 우측 급기울 -> 삭제, 그 외 -> 오른쪽
     # ============================================================
+    def _car_follow_lane_width(self, side):
+        # 단일차선 검출 시 가상 반대차선까지의 오프셋(차폭)을 좌/우로 구분
+        if side == 'left':
+            return self.car_follow_lane_width_left_px
+        return self.car_follow_lane_width_right_px
+
     def _car_follow_lane_select(self, candidates, img_h, img):
         img_w = img.shape[1]
 
@@ -458,14 +477,14 @@ class LaneFollow(Node):
             if abs(angle_deg) < self.car_follow_single_lane_pos_angle_deg:
                 x_bottom = float(self.fit_x(candidate, [img_h - 1])[0])
                 side = 'left' if x_bottom < img_w / 2.0 else 'right'
-                lfit, rfit = self.update_single_lane_track(candidate, side, self.car_follow_lane_width_px)
+                lfit, rfit = self.update_single_lane_track(candidate, side, self._car_follow_lane_width(side))
                 self.last_lane_status = f'car_follow_{side}'
                 self.special_lane_debug += f' | POS {side} x={x_bottom:.0f}'
                 return lfit, rfit
             if angle_deg <= -self.car_follow_drop_angle_deg:
                 self.special_lane_debug += f' | DROP right {angle_deg:.1f}deg'
             else:
-                lfit, rfit = self.update_single_lane_track(candidate, 'right', self.car_follow_lane_width_px)
+                lfit, rfit = self.update_single_lane_track(candidate, 'right', self._car_follow_lane_width('right'))
                 self.last_lane_status = 'car_follow_right'
                 self.special_lane_debug += f' | SET right {angle_deg:.1f}deg'
                 return lfit, rfit
@@ -551,6 +570,21 @@ class LaneFollow(Node):
             return self.prev_lfit.copy(), self.prev_rfit.copy()
         return self._default_lane(img_w, self.lane_width_px)
 
+    def _search_base_inner(self, histogram, lo, hi, from_inner_right):
+        """[lo, hi) 구간에서 안쪽(중앙)부터 바깥으로 스캔해 임계값을 넘는
+        첫 피크의 x 좌표를 반환. 유효 피크가 없으면 기존 argmax로 폴백."""
+        seg = np.asarray(histogram[lo:hi], dtype=float)
+        if seg.size == 0 or seg.max() <= 0:
+            return int(np.argmax(seg)) + lo if seg.size else lo
+        thresh = max(seg.max() * self.base_peak_ratio, self.base_min_sum)
+        idxs = np.where(seg >= thresh)[0]
+        if idxs.size == 0:
+            return int(np.argmax(seg)) + lo
+        start = int(idxs[-1]) if from_inner_right else int(idxs[0])  # 안쪽부터 첫 피크
+        a = max(0, start - self.base_peak_margin)
+        b = min(seg.size, start + self.base_peak_margin + 1)
+        return int(np.argmax(seg[a:b])) + a + lo                     # 피크 중심으로 보정
+
     # ============================================================
     #  슬라이딩 윈도우
     # ============================================================
@@ -562,8 +596,13 @@ class LaneFollow(Node):
         y = img.shape[0]
         histogram = np.sum(img[y // 2:, :], axis=0)
         midpoint = int(histogram.shape[0] / 2)
-        leftx_current = int(np.argmax(histogram[:midpoint]))
-        rightx_current = int(np.argmax(histogram[midpoint:]) + midpoint)
+        if self.inner_base_search:
+            # 왼쪽 절반은 안쪽(오른쪽)부터, 오른쪽 절반은 안쪽(왼쪽)부터 탐색
+            leftx_current = self._search_base_inner(histogram, 0, midpoint, from_inner_right=True)
+            rightx_current = self._search_base_inner(histogram, midpoint, histogram.shape[0], from_inner_right=False)
+        else:
+            leftx_current = int(np.argmax(histogram[:midpoint]))
+            rightx_current = int(np.argmax(histogram[midpoint:]) + midpoint)
 
         window_height = int(y / n_windows)
         nz = img.nonzero()

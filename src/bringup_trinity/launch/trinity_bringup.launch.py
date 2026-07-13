@@ -103,7 +103,7 @@ def generate_launch_description():
         output='screen',
     )
 
-    # 3) 신호등 인지
+    # # 3) 신호등 인지
     # traffic_light_node = Node(
     #     package='obstacle_detection_package',
     #     executable='traffic_light_perception_node',
