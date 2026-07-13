@@ -30,7 +30,7 @@ class LaneFollow(Node):
         self.declare_parameter('white_lower', [0, 0, 190])
         self.declare_parameter('white_upper', [180, 20, 255])
         self.declare_parameter('tophat_enable', True)
-        self.declare_parameter('tophat_kernel_size', 35)
+        self.declare_parameter('tophat_kernel_size', 40)
         self.declare_parameter('tophat_thresh', 30)
         self.declare_parameter('min_lane_pixels', 30)
         # base 탐색: 안쪽(중앙)부터 바깥으로 스캔해 임계값 넘는 첫 피크를 차선 base로 선택
@@ -48,7 +48,7 @@ class LaneFollow(Node):
         self.declare_parameter('min_smooth_speed', 0.45)
 
         # ===== 차선 기하 (공통) =====
-        self.declare_parameter('lane_width_px', 300.0)
+        self.declare_parameter('lane_width_px', 290.0)
         self.declare_parameter('min_lane_overlap_px', 50.0)
         self.declare_parameter('narrow_both_gap_px', 220.0)
         self.declare_parameter('single_lane_track_alpha', 0.80)
@@ -68,12 +68,13 @@ class LaneFollow(Node):
         self.declare_parameter('car_follow_drop_angle_deg', 10.0)        # 이 각도 이상 우측기울이면 차선 삭제
 
         # ===== LAST_CURVE 전용 =====
-        self.declare_parameter('last_curve_max_speed', 0.8)              # 속도 상한
+        self.declare_parameter('last_curve_max_speed', 1.0)              # 속도 상한
 
         # ===== LAST_LANE 진입 트리거 (가로 정지선 감지, BEV 이진화 이미지 기반) =====
         self.declare_parameter('stopline_row_ratio_thresh', 0.4)   # 한 행이 이 비율 이상 흰 픽셀이면 "가로줄"로 카운트
         self.declare_parameter('stopline_min_rows', 3)              # 가로줄로 카운트된 행이 이만큼 있어야 후보로 인정
         self.declare_parameter('stopline_confirm_frames', 1)        # 이 프레임 연속 후보여야 최종 확정(latch)
+        self.declare_parameter('stopline_detect_delay_sec', 3.0)    # LAST_CURVE 진입 후 이 시간 동안 정지선 감지 억제
         self.declare_parameter('last_lane_speed', 0.3)              # 확정 후 속도 상한 (last_curve_max_speed보다 우선)
 
         # ---- 파라미터 읽기 ----
@@ -121,6 +122,7 @@ class LaneFollow(Node):
         self.stopline_row_ratio_thresh = float(self.get_parameter('stopline_row_ratio_thresh').value)
         self.stopline_min_rows = int(self.get_parameter('stopline_min_rows').value)
         self.stopline_confirm_frames = int(self.get_parameter('stopline_confirm_frames').value)
+        self.stopline_detect_delay_sec = float(self.get_parameter('stopline_detect_delay_sec').value)
         self.last_lane_speed = float(self.get_parameter('last_lane_speed').value)
 
         self.tophat_kernel = cv.getStructuringElement(
@@ -165,6 +167,7 @@ class LaneFollow(Node):
         # ---- LAST_LANE(가로 정지선) 감지 상태 ----
         self.stopline_hit_streak = 0
         self.last_lane_triggered = False   # 한번 확정되면 계속 유지 (sticky)
+        self.last_curve_enter_sec = None   # LAST_CURVE 최초 진입 시각 (정지선 감지 억제 타이머용)
 
         # ---- I/O ----
         self.phase_sub = self.create_subscription(
@@ -357,6 +360,17 @@ class LaneFollow(Node):
         # 가로 정지선 감지는 반드시 LAST_CURVE phase 에서만 수행한다.
         # (원형 교차로 등 다른 구간의 전폭 흰 픽셀 오검출 방지)
         if self.behavior_phase != 'LAST_CURVE':
+            self.stopline_hit_streak = 0
+            self.last_curve_enter_sec = None
+            self.last_lane_pub.publish(Bool(data=False))
+            return
+
+        # LAST_CURVE 진입 직후 stopline_detect_delay_sec 동안은 정지선 감지를 억제한다.
+        # (진입 순간에 남아있는 전폭 흰 픽셀로 인한 조기 오검출 방지)
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+        if self.last_curve_enter_sec is None:
+            self.last_curve_enter_sec = now_sec
+        if now_sec - self.last_curve_enter_sec < self.stopline_detect_delay_sec:
             self.stopline_hit_streak = 0
             self.last_lane_pub.publish(Bool(data=False))
             return
@@ -588,7 +602,7 @@ class LaneFollow(Node):
     # ============================================================
     #  슬라이딩 윈도우
     # ============================================================
-    def sliding_window(self, img, n_windows=10, margin=12, minpix=5):
+    def sliding_window(self, img, n_windows=10, margin=16, minpix=5):
         self._update_sticky_hold()
         self.narrow_both_active = False
         self.special_lane_debug = 'off'
