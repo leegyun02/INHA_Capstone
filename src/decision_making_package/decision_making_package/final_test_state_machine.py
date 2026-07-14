@@ -85,8 +85,8 @@ CONE_ESCAPE_SEC_L    = 0.8     # 강하게 꺾은 채 주행할 시간 [s]
 CONE_ESCAPE_W_L      = 2.8     # 탈출 각속도 크기 [rad/s]
 CONE_ESCAPE_SPEED_L  = 1.0     # 탈출 주행 속도 [m/s]
 # 왼쪽 길 (RIGHT)
-CONE_ESCAPE_SEC_R    = 1.5     # 강하게 꺾은 채 주행할 시간 [s]
-CONE_ESCAPE_W_R      = 3.8     # 탈출 각속도 크기 [rad/s]
+CONE_ESCAPE_SEC_R    = 1.0     # 강하게 꺾은 채 주행할 시간 [s]
+CONE_ESCAPE_W_R      = 4.8     # 탈출 각속도 크기 [rad/s]
 CONE_ESCAPE_SPEED_R  = 1.0     # 탈출 주행 속도 [m/s]
 
 # --- Cone 2차 탈출 (반대로 한번 더 꺾어 유지, S자 정렬) ---
@@ -477,14 +477,12 @@ class BehaviorPlannerNode(Node):
         self.state = 'CONE_W1'
         self.timer_target = self.now_sec() + CONE_TIMEOUT_SEC
         side = 'LEFT' if self.cone_escape_dir > 0 else 'RIGHT'
-        c_dist = cones[0][0]
-        s_dist = cones[1][0]
-        w1_dist = math.hypot(self.w1_local[0], self.w1_local[1])
+        # 콘-콘 거리(중앙콘↔측면콘) 와 콘-W1 거리(중앙콘↔W1)
+        cone_cone_dist = math.hypot(cx - sx, cy - sy)
+        cone_w1_dist = math.hypot(self.w1_local[0] - cx, self.w1_local[1] - cy)
         self.get_logger().warn(
             f'🚧 Cone Trigger! escape={side} | '
-            f'중앙콘 d={c_dist:.2f}m(fx={cx:+.2f},ly={cy:+.2f}) '
-            f'측면콘 d={s_dist:.2f}m(fx={sx:+.2f},ly={sy:+.2f}) → '
-            f'W1 d={w1_dist:.2f}m(fx={self.w1_local[0]:+.2f},ly={self.w1_local[1]:+.2f})'
+            f'콘-콘 거리={cone_cone_dist:.2f}m | 중앙콘-W1 거리={cone_w1_dist:.2f}m'
         )
 
     def _update_cone_w1(self, obstacles):
@@ -512,13 +510,16 @@ class BehaviorPlannerNode(Node):
 
         self.w1_local = (cx + self.cone_offset_x, cy + self.cone_offset_y)
 
-        # 디버깅: 라바콘 2개 거리 + W1 거리 실시간 시각화 (0.3s throttle)
-        c_dist = cones[0][0]
-        w1_dist = math.hypot(self.w1_local[0], self.w1_local[1])
-        side_txt = f'측면콘 d={cones[1][0]:.2f}m' if len(cones) >= 2 else '측면콘 없음'
+        # 디버깅(0.3s throttle): 콘-콘 거리(현재 두 콘) + 중앙콘-W1 거리
+        cone_w1_dist = math.hypot(self.w1_local[0] - cx, self.w1_local[1] - cy)
+        if len(cones) >= 2:
+            _, sx, sy = cones[1]
+            cone_cone_dist = math.hypot(cx - sx, cy - sy)
+            cc_txt = f'콘-콘 거리={cone_cone_dist:.2f}m'
+        else:
+            cc_txt = '콘-콘 거리=N/A(콘 1개만 보임)'
         self.get_logger().info(
-            f'[CONE_W1] 중앙콘 d={c_dist:.2f}m(fx={cx:+.2f},ly={cy:+.2f}) | '
-            f'{side_txt} | W1 d={w1_dist:.2f}m(fx={self.w1_local[0]:+.2f},ly={self.w1_local[1]:+.2f})',
+            f'[CONE_W1] {cc_txt} | 중앙콘-W1 거리={cone_w1_dist:.2f}m',
             throttle_duration_sec=0.3,
         )
 

@@ -44,7 +44,7 @@ class LaneFollow(Node):
         self.declare_parameter('yaw_k', 1.0)
         self.declare_parameter('max_steer', 0.6)
         self.declare_parameter('steer_smoothing_alpha', 0.35)
-        self.declare_parameter('steer_slowdown_ratio', 0.35)
+        self.declare_parameter('steer_slowdown_ratio', 0.2)
         self.declare_parameter('min_smooth_speed', 0.45)
 
         # ===== 차선 기하 (공통) =====
