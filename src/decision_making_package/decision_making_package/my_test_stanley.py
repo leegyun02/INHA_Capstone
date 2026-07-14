@@ -43,8 +43,8 @@ class LaneFollow(Node):
         self.declare_parameter('steer_k', 0.002)
         self.declare_parameter('yaw_k', 1.0)
         self.declare_parameter('max_steer', 0.6)
-        self.declare_parameter('steer_smoothing_alpha', 0.35)
-        self.declare_parameter('steer_slowdown_ratio', 0.2)
+        self.declare_parameter('steer_smoothing_alpha', 0.1)
+        self.declare_parameter('steer_slowdown_ratio', 0.0)
         self.declare_parameter('min_smooth_speed', 0.45)
 
         # ===== 차선 기하 (공통) =====
@@ -444,7 +444,7 @@ class LaneFollow(Node):
             steering_delta = raw_steering_angle - self.prev_steer
             alpha = float(np.clip(self.steer_smoothing_alpha, 0.0, 1.0))
             steering_angle = float(np.clip(
-                self.prev_steer + alpha * steering_delta, -self.max_steer, self.max_steer
+                raw_steering_angle, -self.max_steer, self.max_steer
             ))
 
         steer_change_ratio = min(abs(steering_delta) / max(abs(self.max_steer), 0.01), 1.0)
