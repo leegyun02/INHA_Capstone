@@ -43,7 +43,7 @@ class LaneFollow(Node):
         self.declare_parameter('steer_k', 0.002)
         self.declare_parameter('yaw_k', 1.0)
         self.declare_parameter('max_steer', 0.6)
-        self.declare_parameter('steer_smoothing_alpha', 0.1)
+        self.declare_parameter('steer_smoothing_alpha', 0.35)
         self.declare_parameter('steer_slowdown_ratio', 0.0)
         self.declare_parameter('min_smooth_speed', 0.45)
 
@@ -464,10 +464,17 @@ class LaneFollow(Node):
             steering_angle = raw_steering_angle
         else:
             steering_delta = raw_steering_angle - self.prev_steer
-            alpha = float(np.clip(self.steer_smoothing_alpha, 0.0, 1.0))
-            steering_angle = float(np.clip(
-                raw_steering_angle, -self.max_steer, self.max_steer
-            ))
+            if self.behavior_phase == 'CAR_FOLLOW':
+                # CAR_FOLLOW: 이전 조향 기반 스무딩(EMA, alpha=steer_smoothing_alpha) 적용
+                alpha = float(np.clip(self.steer_smoothing_alpha, 0.0, 1.0))
+                steering_angle = float(np.clip(
+                    self.prev_steer + alpha * steering_delta, -self.max_steer, self.max_steer
+                ))
+            else:
+                # 그 외 phase: 스무딩 없이 raw 조향 사용 (현재 동작 유지)
+                steering_angle = float(np.clip(
+                    raw_steering_angle, -self.max_steer, self.max_steer
+                ))
 
         steer_change_ratio = min(abs(steering_delta) / max(abs(self.max_steer), 0.01), 1.0)
         speed_scale = 1.0 - self.steer_slowdown_ratio * steer_change_ratio
