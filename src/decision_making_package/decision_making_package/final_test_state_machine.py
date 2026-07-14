@@ -81,7 +81,7 @@ CONE_SPEED_MIN      = 1.0     # W1 추종 최대 조향 시 최소 속도 [m/s]
 #   escape_dir=+1 → 왼쪽 길(LEFT), escape_dir=-1 → 오른쪽 길(RIGHT)
 #   왼쪽/오른쪽 갈림길에 따라 파라미터를 따로 튜닝할 수 있음.
 # 오른쪽 길 (LEFT)
-CONE_ESCAPE_SEC_L    = 1.2     # 강하게 꺾은 채 주행할 시간 [s]
+CONE_ESCAPE_SEC_L    = 0.8     # 강하게 꺾은 채 주행할 시간 [s]
 CONE_ESCAPE_W_L      = 2.8     # 탈출 각속도 크기 [rad/s]
 CONE_ESCAPE_SPEED_L  = 1.0     # 탈출 주행 속도 [m/s]
 # 왼쪽 길 (RIGHT)
@@ -477,7 +477,15 @@ class BehaviorPlannerNode(Node):
         self.state = 'CONE_W1'
         self.timer_target = self.now_sec() + CONE_TIMEOUT_SEC
         side = 'LEFT' if self.cone_escape_dir > 0 else 'RIGHT'
-        self.get_logger().warn(f'🚧 Cone Trigger! Offset locked → Aiming W1 (escape={side})')
+        c_dist = cones[0][0]
+        s_dist = cones[1][0]
+        w1_dist = math.hypot(self.w1_local[0], self.w1_local[1])
+        self.get_logger().warn(
+            f'🚧 Cone Trigger! escape={side} | '
+            f'중앙콘 d={c_dist:.2f}m(fx={cx:+.2f},ly={cy:+.2f}) '
+            f'측면콘 d={s_dist:.2f}m(fx={sx:+.2f},ly={sy:+.2f}) → '
+            f'W1 d={w1_dist:.2f}m(fx={self.w1_local[0]:+.2f},ly={self.w1_local[1]:+.2f})'
+        )
 
     def _update_cone_w1(self, obstacles):
         # 매 프레임 중앙콘 위치를 다시 찾아 W1 갱신
@@ -500,8 +508,19 @@ class BehaviorPlannerNode(Node):
 
         if cx < CONE_PASS_DIST:
             self._enter_cone_escape('Passed Center Cone')
-        else:
-            self.w1_local = (cx + self.cone_offset_x, cy + self.cone_offset_y)
+            return
+
+        self.w1_local = (cx + self.cone_offset_x, cy + self.cone_offset_y)
+
+        # 디버깅: 라바콘 2개 거리 + W1 거리 실시간 시각화 (0.3s throttle)
+        c_dist = cones[0][0]
+        w1_dist = math.hypot(self.w1_local[0], self.w1_local[1])
+        side_txt = f'측면콘 d={cones[1][0]:.2f}m' if len(cones) >= 2 else '측면콘 없음'
+        self.get_logger().info(
+            f'[CONE_W1] 중앙콘 d={c_dist:.2f}m(fx={cx:+.2f},ly={cy:+.2f}) | '
+            f'{side_txt} | W1 d={w1_dist:.2f}m(fx={self.w1_local[0]:+.2f},ly={self.w1_local[1]:+.2f})',
+            throttle_duration_sec=0.3,
+        )
 
     def _enter_cone_escape(self, reason: str):
         # W1 도달 -> 안쪽 차선으로 강하게 꺾어 짧게 주행 (1차 탈출)
