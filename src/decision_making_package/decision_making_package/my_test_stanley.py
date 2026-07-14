@@ -75,8 +75,8 @@ class LaneFollow(Node):
         self.declare_parameter('last_curve_window_margin', 20)          # 윈도우 반폭(px). 창 넓이 = 2*margin
         # LAST_CURVE 우편향: 단일차선 검출 시 가상 반대차선까지의 오프셋(차폭)을 좌/우로 구분.
         #   left-only -> 넓게(중심 오른쪽), right-only -> 좁게(중심 오른쪽). both는 두 값에서 자동 유도.
-        self.declare_parameter('last_curve_lane_width_left_px', 350.0)   # left-only 가상차폭 (우편향 30px)
-        self.declare_parameter('last_curve_lane_width_right_px', 230.0)  # right-only 가상차폭 (우편향 30px)
+        self.declare_parameter('last_curve_lane_width_left_px', 340.0)   # left-only 가상차폭 (우편향 25px)
+        self.declare_parameter('last_curve_lane_width_right_px', 240.0)  # right-only 가상차폭 (우편향 25px)
 
         # ===== LAST_LANE 진입 트리거 (가로 정지선 감지, BEV 이진화 이미지 기반) =====
         self.declare_parameter('stopline_row_ratio_thresh', 0.4)   # 한 행이 이 비율 이상 흰 픽셀이면 "가로줄"로 카운트
@@ -309,9 +309,13 @@ class LaneFollow(Node):
     def fit_angle_deg(fit):
         return math.degrees(math.atan(float(fit[0])))
 
+    def _curve_lane_mode(self):
+        # LAST_CURVE 및 그 직후 PARKING 구간에서 동일한 차선 계산 로직을 사용한다.
+        return self.behavior_phase in ('LAST_CURVE', 'PARKING')
+
     def _single_lane_pos_angle_deg(self):
         # phase별 단일차선 pos 판정 각도 임계값
-        if self.behavior_phase == 'LAST_CURVE':
+        if self._curve_lane_mode():
             return self.last_curve_single_lane_pos_angle_deg
         return self.normal_single_lane_pos_angle_deg
 
@@ -563,7 +567,7 @@ class LaneFollow(Node):
     def _normal_lane_select(self, candidates, img_h, img_w):
         # LAST_CURVE 모드에서만 lane 선택 근거를 special_lane_debug에 기록해
         # /debugging_image2 오버레이로 발행한다.
-        record = (self.behavior_phase == 'LAST_CURVE')
+        record = self._curve_lane_mode()
 
         def note(text):
             if record:
@@ -589,7 +593,7 @@ class LaneFollow(Node):
             if lane_width >= self.narrow_both_gap_px:
                 self.last_lane_status = 'both'
                 self.both_lane_gap_px = lane_width
-                if self.behavior_phase == 'LAST_CURVE':
+                if self._curve_lane_mode():
                     # both일 때는 실측 중심을 유지하되, 중심선을 오른쪽으로 편향(단일차선 400/180과 대칭)
                     self.center_bias_px = self._last_curve_both_bias_px()
                     note(f'BOTH(LAST_CURVE) gap={lane_width:.0f} L&R by x@0.8 '
@@ -603,7 +607,7 @@ class LaneFollow(Node):
                 # both지만 간격이 좁음
                 self.narrow_both_active = True
                 self.narrow_both_gap = lane_width
-                if self.behavior_phase == 'LAST_CURVE':
+                if self._curve_lane_mode():
                     # LAST_CURVE NARROW_BOTH: 왼쪽으로 기운(기울기 최대·양수) 차선만 남기고 나머지 버림.
                     # 남긴 차선을 우측 차선으로 두고 왼쪽으로 오프셋해 가상 좌측차선 생성.
                     slope_l = float(np.asarray(lfit, dtype=float)[0])
@@ -635,7 +639,7 @@ class LaneFollow(Node):
             if side is None:
                 note('AMBIGUOUS side=None -> fallback')
                 return self._fallback_lane(img_w)
-            lc_w = self._last_curve_lane_width(side) if self.behavior_phase == 'LAST_CURVE' else None
+            lc_w = self._last_curve_lane_width(side) if self._curve_lane_mode() else None
             lfit, rfit = self.update_single_lane_track(candidate, side, lc_w)
             self.last_lane_status = (
                 f'narrow_both_{side}' if self.narrow_both_active else f'tracked_{side}_only'
@@ -650,7 +654,7 @@ class LaneFollow(Node):
             if side is None:
                 note(f'SINGLE(1cand) angle={angle:+.1f}deg side=None -> fallback')
                 return self._fallback_lane(img_w)
-            lc_w = self._last_curve_lane_width(side) if self.behavior_phase == 'LAST_CURVE' else None
+            lc_w = self._last_curve_lane_width(side) if self._curve_lane_mode() else None
             lfit, rfit = self.update_single_lane_track(candidate, side, lc_w)
             self.last_lane_status = f'tracked_{side}_only'
             return lfit, rfit
@@ -771,7 +775,7 @@ class LaneFollow(Node):
         nz = img.nonzero()
         out_img = cv.cvtColor(img, cv.COLOR_GRAY2BGR)
 
-        use_topdown = (self.behavior_phase == 'LAST_CURVE' and self.last_curve_topdown)
+        use_topdown = (self._curve_lane_mode() and self.last_curve_topdown)
         if use_topdown:
             # LAST_CURVE: 위(먼 쪽)에서 아래로 진행 + 전용 윈도우 폭 사용
             left_lane_inds, right_lane_inds = self._scan_top_down(
@@ -867,7 +871,7 @@ class LaneFollow(Node):
             phase_text += ' | LAST_LANE!'
         cv.putText(result, phase_text, (30, 285), cv.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 2, cv.LINE_AA)
 
-        if self.behavior_phase in ('CAR_FOLLOW', 'LAST_CURVE') or self.special_lane_debug != 'off':
+        if self.behavior_phase in ('CAR_FOLLOW', 'LAST_CURVE', 'PARKING') or self.special_lane_debug != 'off':
             # 문장이 길어 화면에서 잘리므로 단어 단위로 줄바꿈해 여러 줄로 표시
             full_text = f'special_lane: {self.special_lane_debug}'
             wrap_len = 42
@@ -912,8 +916,8 @@ class LaneFollow(Node):
 
         hsv_binary = self.binary_filter(self.white_color_filter_hsv(g_filtered))
         tophat_removed = None
-        # LAST_CURVE 구간에서는 tophat 로직을 적용하지 않음
-        if self.tophat_enable and self.behavior_phase != 'LAST_CURVE':
+        # LAST_CURVE(및 이후 PARKING) 구간에서는 tophat 로직을 적용하지 않음
+        if self.tophat_enable and not self._curve_lane_mode():
             tophat_mask = self.tophat_filter(g_filtered)
             self.filtered_img = cv.bitwise_and(hsv_binary, tophat_mask)
             # tophat으로 인해 지워진 픽셀(원래 흰색이었으나 tophat이 제거한 자리)
