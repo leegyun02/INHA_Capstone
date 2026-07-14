@@ -38,12 +38,23 @@ MIN_POINTS       = 4        # 클러스터 최소 점 개수
 MATCH_DIST       = 0.4      # YOLO 검출 ↔ 기존 트래커 매칭 거리 [m]
 SCAN_WINDOW      = 5        # YOLO 각도 주변 스캔 탐색 폭
 
-# --- 터널 벽 인식 (트래킹 없음, bbox 각도 범위 안 2클러스터) ---
-TUNNEL_ANGLE_PAD_DEG = 3.0   # bbox 각도 범위 좌우 여유 [deg]
-TUNNEL_MAX_RANGE     = 2.0   # 터널 벽 최대 거리 [m]
-TUNNEL_CLUSTER_BREAK = 0.15  # 클러스터 경계 거리 점프 [m]
-TUNNEL_MIN_POINTS    = 2     # 벽 클러스터 최소 점 개수
-TUNNEL_BRIDGE_GAP    = 3     # 무효빔 브리징 허용
+# --- 터널 벽 인식 (Seed 확정 + 코리더 폭 게이트) ---
+#   [Seed]   YOLO bbox 각도 창 안 라이다가 있으면 '터널 실재' 확정 (전역 최소 1개 요구).
+#            → YOLO 오검출 + 무관 물체만 있는 프레임을 통째로 배제.
+#   [Expand] 넓은 전방 콘 안 인접빔 연결 클러스터링 → 벽은 bbox 밖 입구까지 한 덩어리.
+#   [Gate]   좌/우 벽은 (코리더 전방 + 터널 폭 이내 |y|<=MAX_OFFSET) 조건으로 선택.
+#            seed 포함 클러스터를 우선하되, 반대쪽 벽은 seed 없이도 폭 게이트로 복구.
+#            → bbox가 작아 한쪽 벽만 프레임에 담겨도 반대 벽을 놓치지 않음.
+#            → 터널 폭 밖 옆 장애물은 폭 게이트에서 걸러짐.
+TUNNEL_MAX_RANGE       = 2.0    # 터널 벽 최대 거리 [m]
+TUNNEL_ANGLE_PAD_DEG   = 3.0    # bbox 씨앗 각도 창 좌우 여유 [deg]
+TUNNEL_SEARCH_HALF_DEG = 80.0   # 확장 탐색 전방 콘 반각 [deg] (hint 중심)
+TUNNEL_CLUSTER_BREAK   = 0.15   # 클러스터 경계 거리 점프 [m]
+TUNNEL_BRIDGE_GAP      = 3      # 무효빔 브리징 허용 (인덱스 갭)
+TUNNEL_WALL_MIN_POINTS = 3      # 벽으로 인정할 클러스터 최소 점 개수
+TUNNEL_WALL_NEAR_K     = 3      # 벽 대표점 계산 시 사용할 입구쪽(최근접) 포인트 개수
+TUNNEL_WALL_MAX_OFFSET = 0.7    # 코리더 축 기준 벽 최대 횡오프셋 [m] (터널 반폭+여유)
+                                #   이보다 옆으로 벗어난 클러스터는 벽 후보에서 제외
 
 # --- RViz 마커 ---
 PUBLISH_DEBUG    = True     # 마커 발행 on/off
@@ -76,6 +87,7 @@ class CameraLidarFusionNode(Node):
 
         self.camera_fov_rad = CAMERA_FOV_DEG * (math.pi / 180.0)
         self.tunnel_pad_rad = TUNNEL_ANGLE_PAD_DEG * (math.pi / 180.0)
+        self.tunnel_search_half_rad = TUNNEL_SEARCH_HALF_DEG * (math.pi / 180.0)
 
         self.latest_scan = None
         self.latest_detections = []      # [(class_name, cx_pixel, bbox_w), ...]
@@ -186,13 +198,15 @@ class CameraLidarFusionNode(Node):
         } for tr in self.trackers
           if tr.pos[0] > FORWARD_MIN and math.hypot(tr.pos[0], tr.pos[1]) <= MAX_RANGE]
 
-        # 5) 터널 벽: bbox 각도 범위 안 라이다를 2클러스터로 → 좌/우 벽
+        # 5) 터널 벽: bbox 씨앗으로 확정 → 코리더 폭 게이트로 좌/우 벽 (입구 최근접)
+        #    터널 중엔 벽/TunnelActive만 발행하고 다른 인식(Cone/Person/Car/Box)은 전부 억제.
+        #    (survivor 씨앗 트래킹으로 살아남은 Cone 등이 터널 중 새어나오는 걸 발행단에서 차단)
         if tunnel_on:
-            combined.extend(self._detect_tunnel_walls(tunnel_det, scan))
-            combined.append({'class': 'TunnelActive', 'source': 'yolo'})
-
-        if yolo_car_seen:
-            combined.append({'class': 'CarDetected', 'source': 'yolo'})
+            walls = self._detect_tunnel_walls(tunnel_det, scan)
+            combined = walls + [{'class': 'TunnelActive', 'source': 'yolo'}]
+        else:
+            if yolo_car_seen:
+                combined.append({'class': 'CarDetected', 'source': 'yolo'})
 
         if not combined:
             return
@@ -249,32 +263,17 @@ class CameraLidarFusionNode(Node):
                 best = (cx, bw)
         return best
 
-    def _detect_tunnel_walls(self, tunnel_det, scan):
-        cx, bw = tunnel_det
-        x_left = cx - bw / 2.0
-        x_right = cx + bw / 2.0
-        ang_a = -(x_left - IMG_W / 2.0) * (self.camera_fov_rad / IMG_W)
-        ang_b = -(x_right - IMG_W / 2.0) * (self.camera_fov_rad / IMG_W)
-        ang_lo = min(ang_a, ang_b) - self.tunnel_pad_rad
-        ang_hi = max(ang_a, ang_b) + self.tunnel_pad_rad
+    @staticmethod
+    def _norm_angle(a):
+        while a > math.pi:
+            a -= 2.0 * math.pi
+        while a < -math.pi:
+            a += 2.0 * math.pi
+        return a
 
-        amin = scan.angle_min
-        ainc = scan.angle_increment
-        rmin = scan.range_min
-
-        pts = []
-        for i, r in enumerate(scan.ranges):
-            angle = amin + i * ainc
-            if angle < ang_lo or angle > ang_hi:
-                continue
-            if not (math.isfinite(r) and rmin < r < TUNNEL_MAX_RANGE):
-                continue
-            pts.append((i, r, angle))
-
-        if len(pts) < TUNNEL_MIN_POINTS:
-            return []
-
-        # 거리 점프 / 무효빔 갭 기준으로 클러스터 분할
+    def _cluster_forward_points(self, pts):
+        """인덱스 순서 pts=[(i, r, angle, in_box), ...] 를
+        거리 점프/무효빔 갭 기준으로 분할. (in_box 등 뒤 필드는 그대로 보존)"""
         clusters = []
         cur = [pts[0]]
         for k in range(1, len(pts)):
@@ -287,37 +286,91 @@ class CameraLidarFusionNode(Node):
             else:
                 cur.append(pts[k])
         clusters.append(cur)
+        return clusters
 
-        clusters = [c for c in clusters if len(c) >= TUNNEL_MIN_POINTS]
-        if not clusters:
+    @staticmethod
+    def _tunnel_wall_entry(fx, fy, side):
+        return {
+            'class': 'TunnelWall',
+            'side': side,
+            'source': 'lidar',
+            'distance_r': round(math.hypot(fx, fy), 3),
+            'forward_x': round(fx, 3),
+            'lateral_y': round(fy, 3),
+        }
+
+    def _detect_tunnel_walls(self, tunnel_det, scan):
+        cx, bw = tunnel_det
+
+        # --- bbox 씨앗 각도 창 (터널 실재 확인용) ---
+        x_left = cx - bw / 2.0
+        x_right = cx + bw / 2.0
+        ang_a = -(x_left - IMG_W / 2.0) * (self.camera_fov_rad / IMG_W)
+        ang_b = -(x_right - IMG_W / 2.0) * (self.camera_fov_rad / IMG_W)
+        box_lo = min(ang_a, ang_b) - self.tunnel_pad_rad
+        box_hi = max(ang_a, ang_b) + self.tunnel_pad_rad
+
+        # --- 코리더 축(hint): 좌/우 분류 + 전방/횡오프셋 계산 기준 ---
+        hint = -(cx - IMG_W / 2.0) * (self.camera_fov_rad / IMG_W)
+        ch, sh = math.cos(hint), math.sin(hint)
+
+        amin = scan.angle_min
+        ainc = scan.angle_increment
+        rmin = scan.range_min
+
+        # 1) 확장 탐색 콘(넓게) 안 유효 라이다. 각 점이 bbox 씨앗인지(in_box) 표시.
+        pts = []
+        for i, r in enumerate(scan.ranges):
+            if not (math.isfinite(r) and rmin < r < TUNNEL_MAX_RANGE):
+                continue
+            angle = amin + i * ainc
+            if abs(self._norm_angle(angle - hint)) > self.tunnel_search_half_rad:
+                continue
+            in_box = (box_lo <= angle <= box_hi)
+            pts.append((i, r, angle, in_box))
+
+        if len(pts) < TUNNEL_WALL_MIN_POINTS:
             return []
 
-        # 클러스터별 대표점(평균) 계산
-        reps = []
+        # 2) 인접빔 연결 클러스터링. 벽은 bbox 밖 입구까지 한 덩어리로 이어짐.
+        clusters = self._cluster_forward_points(pts)
+
+        # 3) 클러스터 요약 + 게이트(코리더 전방 & 터널 폭 이내) → 좌/우 후보
+        #    대표점 = 입구쪽 최근접 K점 평균. seed = bbox 창 포인트 포함 여부.
+        left_cands, right_cands = [], []
         for c in clusters:
-            xs = [p[1] * math.cos(p[2]) for p in c]
-            ys = [p[1] * math.sin(p[2]) for p in c]
-            reps.append((sum(xs) / len(xs), sum(ys) / len(ys), len(c)))
+            if len(c) < TUNNEL_WALL_MIN_POINTS:
+                continue
+            near = sorted(c, key=lambda p: p[1])[:TUNNEL_WALL_NEAR_K]
+            fx = sum(p[1] * math.cos(p[2]) for p in near) / len(near)
+            fy = sum(p[1] * math.sin(p[2]) for p in near) / len(near)
+            x_corr = fx * ch + fy * sh            # 코리더 전방 (양수여야 앞쪽)
+            y_corr = -fx * sh + fy * ch           # 코리더 축 기준 횡오프셋
+            if x_corr <= 0.0:
+                continue                          # 코리더 뒤쪽 클러스터 제외
+            if abs(y_corr) > TUNNEL_WALL_MAX_OFFSET:
+                continue                          # 터널 폭 밖 = 옆 장애물, 제외
+            cand = {'fx': fx, 'fy': fy, 'n': len(c), 'seed': any(p[3] for p in c)}
+            (left_cands if y_corr >= 0.0 else right_cands).append(cand)
 
-        reps.sort(key=lambda p: p[2], reverse=True)   # 점 많은 순
-        top = reps[:2]
+        # 4) 전역 seed 최소 1개: 라이다로 터널 벽이 실제 확인되어야 발행 (오검출 방지)
+        if not any(cd['seed'] for cd in left_cands + right_cands):
+            return []
 
-        if len(top) == 2:
-            top.sort(key=lambda p: p[1], reverse=True)  # y 큰 쪽 = left
-            sides = ['left', 'right']
-        else:
-            sides = ['left' if top[0][1] >= 0 else 'right']
+        # 5) 각 side 선택: seed 포함 우선 → 점 많은 순.
+        #    (반대쪽 벽은 seed 없어도 폭 게이트 통과분 중 최선으로 복구)
+        def pick(cands):
+            if not cands:
+                return None
+            return max(cands, key=lambda s: (1 if s['seed'] else 0, s['n']))
 
         walls = []
-        for (fx, fy, _n), side in zip(top, sides):
-            walls.append({
-                'class': 'TunnelWall',
-                'side': side,
-                'source': 'lidar',
-                'distance_r': round(math.hypot(fx, fy), 3),
-                'forward_x': round(fx, 3),
-                'lateral_y': round(fy, 3),
-            })
+        l = pick(left_cands)
+        r = pick(right_cands)
+        if l is not None:
+            walls.append(self._tunnel_wall_entry(l['fx'], l['fy'], 'left'))
+        if r is not None:
+            walls.append(self._tunnel_wall_entry(r['fx'], r['fy'], 'right'))
         return walls
 
     # ================= YOLO → 위치 =================
