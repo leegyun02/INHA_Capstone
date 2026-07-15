@@ -58,7 +58,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'enable_traffic_light',
-            default_value='false',
+            default_value='true',
             description='신호등(초록불 출발) 미션 On/Off',
         ),
         DeclareLaunchArgument(

@@ -91,7 +91,7 @@ CONE_ESCAPE_SEC_L    = 0.9     # 강하게 꺾은 채 주행할 시간 [s]
 CONE_ESCAPE_W_L      = 4.8     # 탈출 각속도 크기 [rad/s]
 CONE_ESCAPE_SPEED_L  = 1.0     # 탈출 주행 속도 [m/s]
 # 왼쪽 길 (RIGHT)
-CONE_ESCAPE_SEC_R    = 1.3     # 강하게 꺾은 채 주행할 시간 [s]
+CONE_ESCAPE_SEC_R    = 1.15     # 강하게 꺾은 채 주행할 시간 [s]
 CONE_ESCAPE_W_R      = 4.8     # 탈출 각속도 크기 [rad/s]
 CONE_ESCAPE_SPEED_R  = 1.0     # 탈출 주행 속도 [m/s]
 
