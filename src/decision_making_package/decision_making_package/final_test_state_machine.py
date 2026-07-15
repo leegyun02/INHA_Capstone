@@ -110,13 +110,13 @@ TUNNEL_ENABLE       = True
 TUNNEL_GAIN         = 3.0
 TUNNEL_WMAX         = 3.0
 TUNNEL_SPEED        = 1.0
-TUNNEL_HOLD_SEC     = 1.5
+TUNNEL_HOLD_SEC     = 1.0
 # 터널 진입 후 이 시간[s] 동안은 터널 중점 조향을 하지 않고 기존 NORMAL(Stanley) 주행 유지.
 # 0이면 진입 즉시 중점 조향 시작 (기존 동작).
-TUNNEL_NORMAL_DELAY_SEC = 0.5
+TUNNEL_NORMAL_DELAY_SEC = 0.0
 PRE_CAR_FOLLOW_SEC  = 4.0     # 터널 종료 직후 CAR_FOLLOW 유지 시간 [s]
 # 터널 중점 횡오프셋 [m].
-TUNNEL_CENTER_OFFSET = 0.0
+TUNNEL_CENTER_OFFSET = 0.1
 
 # --- LAST_CURVE (테스트용) ---
 LAST_CURVE_TEST_TIMEOUT_SEC = 200.0   # LAST_CURVE 진입 후 이 시간 지나면 강제 NORMAL 복귀 [s]
