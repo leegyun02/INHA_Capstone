@@ -34,14 +34,15 @@ RED_LOWER1 = (0, 80, 80)
 RED_UPPER1 = (10, 255, 255)
 RED_LOWER2 = (160, 80, 80)
 RED_UPPER2 = (180, 255, 255)
-# 초록
-GREEN_LOWER = (40, 40, 40)   # 밝기(V) 임계 낮게: 초록이 약하게 빛나도 잡히게
+# 초록 (S 하한을 높여 회색/흰색/옅은 파랑 등 무채색 배경을 배제, 선명한 초록만)
+GREEN_LOWER = (40, 90, 90)   # 채도 90 이상: 줄무늬 옷·바닥 같은 저채도 배경 걸러냄
 GREEN_UPPER = (90, 255, 255)
 
 # --- 판단 ---
-COLOR_RATIO_THRES = 0.03     # ROI 대비 해당 색 픽셀 비율 임계
+COLOR_RATIO_THRES = 0.03     # 빨강용: ROI 대비 빨강 픽셀 비율 임계
+GREEN_RATIO_THRES = 0.005    # 초록용: 과다노출 초록불이 매우 약해(~0.006~0.01) 임계 더 낮춤 (배경은 채도90 방어)
 RED_CONFIRM       = 3        # 빨강 연속 프레임 (빨강 상태 확정)
-GREEN_CONFIRM     = 3        # 초록 연속 프레임 (초록 확정 → 출발)
+GREEN_CONFIRM     = 5        # 초록 연속 프레임 (지속돼야 확정)
 
 PUBLISH_DEBUG     = True      # 디버그 이미지 발행 여부
 DEBUG_TOPIC       = '/traffic_light/debug'
@@ -65,7 +66,7 @@ class TrafficLightNode(Node):
         if PUBLISH_DEBUG:
             self.pub_debug = self.create_publisher(Image, DEBUG_TOPIC, 10)
 
-        self.get_logger().info('신호등 인식 노드 시작 (빨강 대기 중)')
+        self.get_logger().info('신호등 인식 노드 시작 (초록 대기 중)')
 
     def image_callback(self, msg):
         if self.done:
@@ -94,33 +95,24 @@ class TrafficLightNode(Node):
         green_ratio = cv2.countNonZero(green_mask) / total
 
         # --- 상태 판단 ---
-        # 1단계: 빨강 먼저 확인
-        if not self.red_seen:
-            if red_ratio > COLOR_RATIO_THRES:
-                self.red_count += 1
-                if self.red_count >= RED_CONFIRM:
-                    self.red_seen = True
-                    self.get_logger().info('🔴 빨강 확인 → 초록 전환 대기')
-            else:
-                self.red_count = 0
-        # 2단계: 빨강 본 뒤 초록 전환 감지
+        # 빨강 여부와 무관하게, "선명한 초록이 지속적으로" 보일 때만 출발 신호 발행.
+        #   green_ratio > red_ratio : 빨강이 우세한 순간엔 초록으로 오인하지 않도록 하는 안전장치
+        #   GREEN_CONFIRM 연속 프레임 : 순간 오검출 배제 (진짜 초록불은 계속 켜져 있음)
+        if green_ratio > GREEN_RATIO_THRES and green_ratio > red_ratio:
+            self.green_count += 1
+            if self.green_count >= GREEN_CONFIRM:
+                self.pub.publish(String(data='Green'))
+                self.get_logger().info('🟢 초록 확정 → 출발 신호 발행, 감지 종료')
+                self.done = True
+                self.destroy_subscription(self.image_sub)  # 스스로 종료
         else:
-            if green_ratio > COLOR_RATIO_THRES and green_ratio > red_ratio:
-                self.green_count += 1
-                if self.green_count >= GREEN_CONFIRM:
-                    self.pub.publish(String(data='Green'))
-                    self.get_logger().info('🟢 초록 확정 → 출발 신호 발행, 감지 종료')
-                    self.done = True
-                    self.destroy_subscription(self.image_sub)  # 스스로 종료
-            else:
-                self.green_count = 0
+            self.green_count = 0
 
         # 디버그
         if PUBLISH_DEBUG:
             dbg = img.copy()
             cv2.rectangle(dbg, (x1, y1), (x2, y2), (0, 255, 255), 2)
-            state = 'GREEN-WAIT' if self.red_seen else 'RED-WAIT'
-            cv2.putText(dbg, f'{state} R:{red_ratio:.2f} G:{green_ratio:.2f}',
+            cv2.putText(dbg, f'WAIT-GREEN R:{red_ratio:.3f} G:{green_ratio:.3f} cnt:{self.green_count}/{GREEN_CONFIRM}',
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             try:
                 self.pub_debug.publish(self.bridge.cv2_to_imgmsg(dbg, encoding='bgr8'))

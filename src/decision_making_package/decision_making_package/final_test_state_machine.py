@@ -51,7 +51,9 @@ PUB_PHASE           = '/behavior/phase'
 PUB_WAYPOINT_MARKER = '/behavior/waypoints'   # RViz 웨이포인트 (laser_link 프레임)
 
 # --- 신호등 출발 ---
-USE_TRAFFIC_START   = False
+# True면 시작 시 WAITING_GREEN 상태로 정지 대기 → /traffic_light='Green' 수신 시에만 DRIVING 진입.
+# (신호등 없이 테스트하려면 launch/CLI에서 enable_traffic_light:=False 로 끄면 됨)
+USE_TRAFFIC_START   = True
 
 # --- 사람 정지 ---
 PERSON_ENABLE       = False   # 사람 정지 미션 On/Off (기본값, enable_person 파라미터로도 제어)
@@ -105,7 +107,7 @@ TUNNEL_ENABLE       = True
 TUNNEL_GAIN         = 3.0
 TUNNEL_WMAX         = 3.0
 TUNNEL_SPEED        = 1.0
-TUNNEL_HOLD_SEC     = 1.0
+TUNNEL_HOLD_SEC     = 1.5
 # 터널 진입 후 이 시간[s] 동안은 터널 중점 조향을 하지 않고 기존 NORMAL(Stanley) 주행 유지.
 # 0이면 진입 즉시 중점 조향 시작 (기존 동작).
 TUNNEL_NORMAL_DELAY_SEC = 0.5
