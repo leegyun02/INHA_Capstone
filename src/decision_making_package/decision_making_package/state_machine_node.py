@@ -53,7 +53,7 @@ CAR_MAX_CAP         = 1.0
 
 # --- Cone 갈림길 (Local Navigation) ---
 CONE_ENABLE         = True
-CONE_AIM_DIST       = 1.5     # 콘 2개가 이 안에 들어오면 W1 미션 시작 [m]
+CONE_AIM_DIST       = 2.0     # 콘 2개가 이 안에 들어오면 W1 미션 시작 [m]
 CONE_PASS_DIST      = 0.2     # 중앙콘이 이 거리 이내로 들어오면 통과로 간주 [m]
 CONE_TIMEOUT_SEC    = 6.0     # 무한루프 방지 타이머 [s]
 CONE_AIM_GAIN       = 4.0     # 조향 게인 (angular.z = GAIN * 가상_ly) [1/s]

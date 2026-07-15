@@ -73,7 +73,10 @@ CAR_MAX_CAP         = 1.0
 # --- Cone 갈림길 (Local Navigation) ---
 CONE_ENABLE         = True
 CONE_AIM_DIST       = 1.5     # 콘 2개가 이 안에 들어오면 W1 미션 시작 [m]
-CONE_PASS_DIST      = 0.2     # 중앙콘이 이 거리 이내로 들어오면 통과로 간주 [m]
+# 중앙콘이 이 거리 이내로 들어오면 통과로 간주 [m] (좌/우 갈림길별로 분리)
+#   escape_dir=+1 → 왼쪽 길(LEFT)=_L, escape_dir=-1 → 오른쪽 길(RIGHT)=_R
+CONE_PASS_DIST_L    = 0.2     # 오른쪽 갈림길 통과 판정 거리 [m]
+CONE_PASS_DIST_R    = 0.2     # 왼쪽 갈림길 통과 판정 거리 [m]
 CONE_TIMEOUT_SEC    = 6.0     # 무한루프 방지 타이머 [s]
 CONE_AIM_GAIN       = 4.0     # 조향 게인 (angular.z = GAIN * 목표_ly) [1/s] (접근/W1 공용)
 CONE_AIM_WMAX       = 4.9     # 각속도 제한 [rad/s] (접근/W1 공용)
@@ -88,7 +91,7 @@ CONE_ESCAPE_SEC_L    = 0.9     # 강하게 꺾은 채 주행할 시간 [s]
 CONE_ESCAPE_W_L      = 4.8     # 탈출 각속도 크기 [rad/s]
 CONE_ESCAPE_SPEED_L  = 1.0     # 탈출 주행 속도 [m/s]
 # 왼쪽 길 (RIGHT)
-CONE_ESCAPE_SEC_R    = 1.1     # 강하게 꺾은 채 주행할 시간 [s]
+CONE_ESCAPE_SEC_R    = 1.3     # 강하게 꺾은 채 주행할 시간 [s]
 CONE_ESCAPE_W_R      = 4.8     # 탈출 각속도 크기 [rad/s]
 CONE_ESCAPE_SPEED_R  = 1.0     # 탈출 주행 속도 [m/s]
 
@@ -98,7 +101,7 @@ CONE_ESCAPE2_SEC_L   = 0.4     # 반대로 꺾은 채 유지할 시간 [s]
 CONE_ESCAPE2_W_L     = 3.0     # 반대 탈출 각속도 크기 [rad/s]
 CONE_ESCAPE2_SPEED_L = 1.0     # 반대 탈출 주행 속도 [m/s]
 # 왼쪽 길 (RIGHT)
-CONE_ESCAPE2_SEC_R   = 1.0     # 반대로 꺾은 채 유지할 시간 [s]
+CONE_ESCAPE2_SEC_R   = 0.7     # 반대로 꺾은 채 유지할 시간 [s]
 CONE_ESCAPE2_W_R     = 1.5     # 반대 탈출 각속도 크기 [rad/s]
 CONE_ESCAPE2_SPEED_R = 1.0     # 반대 탈출 주행 속도 [m/s]
 
@@ -507,7 +510,9 @@ class BehaviorPlannerNode(Node):
         cones.sort(key=lambda c: c[0])
         _, cx, cy = cones[0]
 
-        if cx < CONE_PASS_DIST:
+        # 좌/우 갈림길에 따라 통과 판정 거리 선택 (escape_dir>0=LEFT=_L, <0=RIGHT=_R)
+        pass_dist = CONE_PASS_DIST_L if self.cone_escape_dir > 0 else CONE_PASS_DIST_R
+        if cx < pass_dist:
             self._enter_cone_escape('Passed Center Cone')
             return
 

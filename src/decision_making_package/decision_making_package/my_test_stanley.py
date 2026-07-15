@@ -70,7 +70,7 @@ class LaneFollow(Node):
         # ===== LAST_CURVE 전용 =====
         self.declare_parameter('last_curve_max_speed', 1.0)              # 속도 상한
         self.declare_parameter('last_curve_single_lane_pos_angle_deg', 7.0)  # |각도|<이 값이면 최하단 x위치로 좌/우 판정
-        self.declare_parameter('last_curve_topdown', False)              # 위->아래 윈도우 진행
+        self.declare_parameter('last_curve_topdown', True)              # 위->아래 윈도우 진행
         self.declare_parameter('last_curve_topdown_seed_band', 0.5)     # 상단 시드 밴드 비율(상단 이 비율만큼 누적)
         self.declare_parameter('last_curve_window_margin', 20)          # 윈도우 반폭(px). 창 넓이 = 2*margin
         # LAST_CURVE 우편향: 단일차선 검출 시 가상 반대차선까지의 오프셋(차폭)을 좌/우로 구분.
