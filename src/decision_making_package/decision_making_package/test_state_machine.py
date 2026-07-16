@@ -1,37 +1,38 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-test_state_machine.py
-- state_machine_node.py 를 베이스로, state_machine_cone_node.py 의
-  '라바콘 회피 후 복구' 로직만 추가한 버전.
+behavior_planner_node.py
 - /stanley/cmd_vel(조향+속도)을 받아 상태에 따라 게이팅 후 /cmd_vel 발행
 - 상태: WAITING_GREEN → DRIVING ↔ PERSON_STOP → PERSON_PASS → DRIVING
-        DRIVING ↔ CONE_W1 → CONE_RECOVERY → CONE_HEADING_ALIGN → CONE_EXIT → DRIVING
+        DRIVING → CONE_APPROACH → CONE_W1 → CONE_ESCAPE → CONE_ESCAPE2 → DRIVING
         DRIVING → TUNNEL → DRIVING
         DRIVING → PARKING_APPROACH → PARKING_REPLAY → PARKING_DONE (종료 상태)
 - Cone 미션 (Local Waypoint 기반):
-    오도메트리 없이 오직 라이다 기준 상대 좌표 사용.
-    최초 2개 감지 시 중앙콘과 측면콘의 오프셋을 기억.
-    이후 지속적으로 감지되는 중앙콘 위치에 오프셋을 더해 가상의 W1(빈공간)을 실시간 추종.
-    W1까지 갔던 cmd_vel을 저장했다가, 통과 후 angular.z 부호를 반대로 재생해 차선 복귀 자세를 안정화.
+    오도메트리 없이 라이다 상대 좌표만 사용.
+    콘이 처음 보이면 CONE_APPROACH: 가장 가까운 중앙콘을 향해 조향(속도는 stanley).
+    콘 2개가 AIM_DIST 안에 들어오면 중앙콘/측면콘 오프셋을 기억해
+    가상 W1(빈 공간)을 실시간 추종하며 통과.
+    W1 도달 후 CONE_ESCAPE: 안쪽 차선(콘이 있던 쪽)으로 강하게 꺾어
+    CONE_ESCAPE_SEC 동안 주행.
+    이어서 CONE_ESCAPE2: 반대로 한 번 더 꺾어 CONE_ESCAPE2_SEC 동안 유지(S자 정렬)
+    한 뒤 DRIVING 복귀 → LAST_CURVE latch.
 - 평행주차 미션 (cmd_vel_record_replay_node.py 를 이 상태머신에 통합한 버전):
     my_test_stanley.py 가 가로 정지선(코스 마지막 구간)을 감지하면 /lane/last_lane_detected
-    (std_msgs/Bool) 를 True로 발행한다. 이 노드는 DRIVING 중 그 신호를 받으면 PARKING_APPROACH로
-    전환해 라이다 전방 섹터를 보며 approach_speed로 직진 접근하고, front_trigger_dist 이내로
-    들어오면 PARKING_REPLAY로 전환해 PARKING_RECORD_FILE(cmd_vel_record.json)에 저장된
-    (dt, vx, wz) 시퀀스를 그대로 재생한다. 재생이 끝나면 PARKING_DONE(정차 유지, 종료 상태)으로
-    남는다. 트리거는 노드당 한 번만 발동한다(parking_triggered).
+    (std_msgs/Bool) 를 True로 발행한다. DRIVING 중 그 신호를 받으면 PARKING_APPROACH로
+    전환해 라이다 전방 섹터를 보며 approach_speed로 직진 접근하고, front_trigger_dist
+    이내로 들어오면 PARKING_REPLAY로 전환해 PARKING_RECORD_FILE(cmd_vel_record.json)에
+    저장된 (dt, vx, wz) 시퀀스를 그대로 재생한다. 재생이 끝나면 PARKING_DONE(정차 유지,
+    종료 상태)으로 남는다. 트리거는 노드당 한 번만 발동한다(parking_triggered).
 """
 
 import json
 import math
 import os
 import rclpy
-from rclpy._rclpy_pybind11 import RCLError
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from geometry_msgs.msg import Twist
-from sensor_msgs.msg import Imu, LaserScan
+from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool, String
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -43,96 +44,100 @@ from visualization_msgs.msg import Marker, MarkerArray
 SUB_CTRL_CMD        = '/stanley/cmd_vel'
 SUB_OBSTACLES       = '/obstacles/fused'
 SUB_TRAFFIC         = '/traffic_light'
-SUB_IMU             = '/imu'
 SUB_SCAN            = '/scan'                     # 주차 자동 접근용 라이다 입력
 SUB_LAST_LANE       = '/lane/last_lane_detected'  # my_test_stanley.py 가 발행하는 가로 정지선 감지 결과
 PUB_CMD_VEL         = '/cmd_vel'
 PUB_PHASE           = '/behavior/phase'
-PUB_WAYPOINT_MARKER = '/behavior/waypoints'  # RViz 웨이포인트 (laser_link 프레임)
+PUB_WAYPOINT_MARKER = '/behavior/waypoints'   # RViz 웨이포인트 (laser_link 프레임)
 
 # --- 신호등 출발 ---
-USE_TRAFFIC_START = False
+# True면 시작 시 WAITING_GREEN 상태로 정지 대기 → /traffic_light='Green' 수신 시에만 DRIVING 진입.
+# (신호등 없이 테스트하려면 launch/CLI에서 enable_traffic_light:=False 로 끄면 됨)
+USE_TRAFFIC_START   = True
 
 # --- 사람 정지 ---
-PERSON_STOP_DIST  = 0.8
-PERSON_WAIT_SEC   = 2.5
-PERSON_PASS_SEC   = 5.0
+PERSON_ENABLE       = False   # 사람 정지 미션 On/Off (기본값, enable_person 파라미터로도 제어)
+PERSON_STOP_DIST    = 0.75
+PERSON_WAIT_SEC     = 1.7
+PERSON_PASS_SEC     = 5.0
 
-# --- Car 추종 ---
-CAR_GATE_LAT      = 0.6
-CAR_STOP_DIST     = 0.40
-CAR_RESUME_DIST   = 0.55
-CAR_MID_DIST      = 0.80
-CAR_CRUISE_DIST   = 1.50
-CAR_MID_SPEED     = 0.5
-CAR_MAX_CAP       = 1.0
+# --- 사람 감지 phase (person_stop 정지 미션과 별개) ---
+# 사람이 이 거리[m] 이내로 들어오면 /behavior/phase 를 PERSON 으로 발행.
+# obstacle 목록에 Person 이 하나도 없으면 다시 NORMAL 로 복귀한다.
+# (PERSON phase 에서는 stanley 가 기존 NORMAL 주행 + 차선 중점 왼쪽 오프셋을 적용)
+PERSON_PHASE_DIST   = 2.0
+
+# --- Car 추종 (속도 캡) ---
+CAR_GATE_LAT        = 0.5     # 앞차 추종 허용 좌우 거리 [m] (차선 밖이면 무시) 기존 0.6
+CAR_STOP_DIST       = 0.2
+CAR_RESUME_DIST     = 0.3
+CAR_MID_DIST        = 0.60
+CAR_CRUISE_DIST     = 1.50
+CAR_MID_SPEED       = 0.5
+CAR_MAX_CAP         = 1.0
 
 # --- Cone 갈림길 (Local Navigation) ---
-CONE_ENABLE       = True
-CONE_AIM_DIST     = 1.55    # 콘 2개가 이 안에 들어오면 미션 시작 [m]
-CONE_PASS_DIST    = 0.2     # 중앙콘이 차 앞 이 거리 이내로 들어오면 통과로 간주 [m]
-CONE_W1_PASS_DIST = 0.30    # W1 자체가 차 앞 이 거리 이내로 들어오면 통과로 간주 [m]
-CONE_W1_STUCK_SEC = 0.8     # W1이 이 시간 동안 가까워지지 않으면 recovery로 전환 [s]
-CONE_W1_PROGRESS_EPS = 0.05 # W1 x가 이만큼 줄어야 진행 중으로 인정 [m]
-CONE_TIMEOUT_SEC  = 10.0     # 무한루프 방지 타이머
+CONE_ENABLE         = True
+CONE_AIM_DIST       = 1.5     # 콘 2개가 이 안에 들어오면 W1 미션 시작 [m]
+# 중앙콘이 이 거리 이내로 들어오면 통과로 간주 [m] (좌/우 갈림길별로 분리)
+#   escape_dir=+1 → 왼쪽 길(LEFT)=_L, escape_dir=-1 → 오른쪽 길(RIGHT)=_R
+CONE_PASS_DIST_L    = 0.2     # 오른쪽 갈림길 통과 판정 거리 [m]
+CONE_PASS_DIST_R    = 0.2     # 왼쪽 갈림길 통과 판정 거리 [m]
+CONE_TIMEOUT_SEC    = 6.0     # 무한루프 방지 타이머 [s]
+CONE_AIM_GAIN       = 4.0     # 조향 게인 (angular.z = GAIN * 목표_ly) [1/s] (접근/W1 공용)
+CONE_AIM_WMAX       = 4.9     # 각속도 제한 [rad/s] (접근/W1 공용)
+CONE_SPEED_MAX      = 1.0     # W1 추종 직진(조향 0) 시 최대 속도 [m/s]
+CONE_SPEED_MIN      = 1.0     # W1 추종 최대 조향 시 최소 속도 [m/s]
 
-CONE_AIM_GAIN     = 4.0     # 조향 게인 (angular.z = GAIN * 가상_ly) [1/s]
-CONE_AIM_WMAX     = 3.0     # 각속도 제한 [rad/s]
-CONE_SPEED_MAX    = 0.85    # 직진(조향 0) 시 최대 속도 [m/s]
-CONE_SPEED_MIN    = 0.3     # 최대 조향 시 최소 속도 [m/s]
+# --- Cone 1차 탈출 (W1 통과 후 안쪽 차선으로 복귀) ---
+#   escape_dir=+1 → 왼쪽 길(LEFT), escape_dir=-1 → 오른쪽 길(RIGHT)
+#   왼쪽/오른쪽 갈림길에 따라 파라미터를 따로 튜닝할 수 있음.
+# 오른쪽 길 (LEFT)
+CONE_ESCAPE_SEC_L    = 0.9     # 강하게 꺾은 채 주행할 시간 [s]
+CONE_ESCAPE_W_L      = 4.8     # 탈출 각속도 크기 [rad/s]
+CONE_ESCAPE_SPEED_L  = 1.0     # 탈출 주행 속도 [m/s]
+# 왼쪽 길 (RIGHT)
+CONE_ESCAPE_SEC_R    = 1.15     # 강하게 꺾은 채 주행할 시간 [s]
+CONE_ESCAPE_W_R      = 4.8     # 탈출 각속도 크기 [rad/s]
+CONE_ESCAPE_SPEED_R  = 1.0     # 탈출 주행 속도 [m/s]
 
-# --- Cone 복구(Recovery) 재생 ---
-CONE_RECOVERY_SPEED_SCALE = 1.0  # 기록 속도 재생 비율
-CONE_RECOVERY_W_SCALE     = 1.0  # 기록 조향 반대 재생 비율
-CONE_RECOVERY_RIGHT_SCALE = 2.0 # 오른쪽 복구(cmd_w 음수) 조향 추가 배율
-CONE_RECOVERY_LEFT_SCALE  = 1.0  # 왼쪽 복구(cmd_w 양수) 조향 추가 배율
-CONE_RECOVERY_SIGN_LOCK   = True # True면 recovery 조향 방향을 회피 시작 방향의 반대로 고정
-CONE_RECOVERY_SIGN_MIN_W  = 0.15 # recovery 방향 판단에 사용할 최소 조향 [rad/s]
-CONE_RECOVERY_PURE_REPLAY = True # True면 recovery 중 기록 cmd_w를 정확히 반대 부호로만 재생
-CONE_RECOVERY_MAX_SEC     = 6.0  # 복구 안전 타이머 [s] (history가 있으면 replay를 우선 끝까지 수행)
-CONE_USE_IMU_HEADING      = True # 복구 종료를 IMU yaw 기준으로 보정
-CONE_HEADING_K            = 1.8  # 초기 heading 복귀 보정 게인
-CONE_HEADING_WMAX         = 3.0  # heading 보정 각속도 제한 [rad/s]
-CONE_HEADING_TOL          = 0.06 # 초기 heading 복귀 완료 허용 오차 [rad]
-CONE_HEADING_SPEED        = 0.45 # history 끝난 뒤 heading만 맞출 때 속도 [m/s]
-CONE_HEADING_ALIGN_MAX_SEC = 3.0 # replay 이후 yaw 정렬 최대 시간 [s]
-CONE_EXIT_HOLD_SEC        = 1.0  # yaw 정렬 후 lane follower로 넘기기 전 최소 heading 유지 시간 [s]
-CONE_EXIT_MAX_SEC         = 2.5  # CONE_EXIT 최대 유지 시간 [s]
-CONE_EXIT_TOL             = 0.12 # CONE_EXIT 종료 yaw 허용 오차 [rad]
-CONE_EXIT_SPEED           = 0.35 # CONE_EXIT 중 전진 속도 [m/s]
-CONE_EXIT_WMAX            = 0.6  # CONE_EXIT 중 yaw 유지 보정 각속도 제한 [rad/s]
-CONE_LOG_SEC              = 0.5  # 콘 디버그 로그 주기 [s]
-
-# --- Cone 기준 진행방향 보정 ---
-CONE_USE_PAIR_HEADING      = True # 두 콘을 잇는 선의 수직 방향을 탈출 후 진행 yaw 기준으로 사용
-CONE_PAIR_HEADING_ALPHA    = 0.35 # 두 콘 heading 갱신 low-pass 비율
-CONE_PAIR_HEADING_MIN_SEP  = 0.20 # heading 계산에 사용할 두 콘 최소 거리 [m]
-CONE_PAIR_HEADING_MAX_SEP  = 1.50 # heading 계산에 사용할 두 콘 최대 거리 [m]
-CONE_PAIR_HEADING_MAX_ABS  = 0.90 # 너무 틀어진 cone heading은 오검출로 보고 무시 [rad]
+# --- Cone 2차 탈출 (반대로 한번 더 꺾어 유지, S자 정렬) ---
+# 오른쪽 길 (LEFT)
+CONE_ESCAPE2_SEC_L   = 0.4     # 반대로 꺾은 채 유지할 시간 [s]
+CONE_ESCAPE2_W_L     = 3.0     # 반대 탈출 각속도 크기 [rad/s]
+CONE_ESCAPE2_SPEED_L = 1.0     # 반대 탈출 주행 속도 [m/s]
+# 왼쪽 길 (RIGHT)
+CONE_ESCAPE2_SEC_R   = 0.7     # 반대로 꺾은 채 유지할 시간 [s]
+CONE_ESCAPE2_W_R     = 1.5     # 반대 탈출 각속도 크기 [rad/s]
+CONE_ESCAPE2_SPEED_R = 1.0     # 반대 탈출 주행 속도 [m/s]
 
 # --- Tunnel 주행 ---
-TUNNEL_ENABLE     = True
-TUNNEL_GAIN       = 3.0
-TUNNEL_WMAX       = 3.0
-TUNNEL_SPEED      = 0.8
-TUNNEL_HOLD_SEC   = 1.0
-PRE_CAR_FOLLOW_SEC = 0.0    # 터널 종료 직후 PRE_CAR_FOLLOW(=CAR_FOLLOW) 유지 시간 [s], 0이면 비활성
+TUNNEL_ENABLE       = True
+TUNNEL_GAIN         = 3.0
+TUNNEL_WMAX         = 3.0
+TUNNEL_SPEED        = 1.0
+TUNNEL_HOLD_SEC     = 1.5
+# 터널 진입 후 이 시간[s] 동안은 터널 중점 조향을 하지 않고 기존 NORMAL(Stanley) 주행 유지.
+# 0이면 진입 즉시 중점 조향 시작 (기존 동작).
+TUNNEL_NORMAL_DELAY_SEC = 0.5
+PRE_CAR_FOLLOW_SEC  = 4.0     # 터널 종료 직후 CAR_FOLLOW 유지 시간 [s]
+# 터널 중점 횡오프셋 [m].
+TUNNEL_CENTER_OFFSET = 0.0
 
-# --- LAST_CURVE 테스트용 ---
-LAST_CURVE_TEST_TIMEOUT_SEC = 10.0  # [테스트용] LAST_CURVE phase 진입 후 이 시간 지나면 강제로 NORMAL 복귀
+# --- LAST_CURVE (테스트용) ---
+LAST_CURVE_TEST_TIMEOUT_SEC = 200.0   # LAST_CURVE 진입 후 이 시간 지나면 강제 NORMAL 복귀 [s]
 
 # --- 평행주차 (cmd_vel_record_replay_node.py 통합) ---
-PARKING_ENABLE              = True
-PARKING_RECORD_FILE         = os.path.expanduser('~/trinity_ws/cmd_vel_record.json')
-PARKING_FRONT_ANGLE_CENTER      = 0.0                 # 전방 섹터 중심 각도 (REP103: 0=전방)
-PARKING_FRONT_ANGLE_HALF_WIDTH  = math.radians(5)     # 전방 섹터 폭
-PARKING_FRONT_TRIGGER_DIST  = 0.35   # 전방벽이 이 거리[m] 이하가 되면 자동으로 REPLAY 시작
-PARKING_APPROACH_SPEED      = 0.3    # front_trigger_dist 도달 전까지 직진 접근 속도 [m/s]
+PARKING_RECORD_FILE            = os.path.expanduser('~/trinity_ws/cmd_vel_record.json')
+PARKING_FRONT_ANGLE_CENTER     = 0.0                 # 전방 섹터 중심 각도 (REP103: 0=전방)
+PARKING_FRONT_ANGLE_HALF_WIDTH = math.radians(5)     # 전방 섹터 폭
+PARKING_FRONT_TRIGGER_DIST     = 0.35  # 전방벽이 이 거리[m] 이하가 되면 자동으로 REPLAY 시작
+PARKING_APPROACH_SPEED         = 0.3    # front_trigger_dist 도달 전까지 직진 접근 속도 [m/s]
 
 # --- Class Name ---
-PERSON_CLASS      = 'Person'
-CAR_CLASS         = 'Car'
-CONE_CLASS        = 'Cone'
+PERSON_CLASS        = 'Person'
+CAR_CLASS           = 'Car'
+CONE_CLASS          = 'Cone'
 # ============================================================
 
 
@@ -140,28 +145,43 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
-def normalize_angle(angle):
-    while angle > math.pi:
-        angle -= 2.0 * math.pi
-    while angle < -math.pi:
-        angle += 2.0 * math.pi
-    return angle
-
-
-def yaw_from_quaternion(q):
-    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-    return math.atan2(siny_cosp, cosy_cosp)
-
-
 class BehaviorPlannerNode(Node):
     def __init__(self):
-        super().__init__('test_state_machine_node')
+        super().__init__('behavior_planner_node')
 
-        self.state = 'WAITING_GREEN' if USE_TRAFFIC_START else 'DRIVING'
+        # ============================================================
+        #  파라미터 (런치/CLI 에서 On/Off)
+        #   - debug            : 디버그 로그 출력 여부
+        #   - enable_traffic_light : 신호등(초록불 출발) 미션
+        #   - enable_car_follow    : 앞차 추종(속도 캡) 미션
+        #   - enable_cone          : 콘 갈림길 주행 미션
+        #   - enable_tunnel        : 터널 주행 미션
+        #   - enable_person        : 사람 정지 미션
+        # ============================================================
+        self.declare_parameter('debug', False)
+        self.declare_parameter('enable_traffic_light', USE_TRAFFIC_START)
+        self.declare_parameter('enable_car_follow', True)
+        self.declare_parameter('enable_cone', CONE_ENABLE)
+        self.declare_parameter('enable_tunnel', TUNNEL_ENABLE)
+        self.declare_parameter('enable_person', PERSON_ENABLE)
+        self.declare_parameter('enable_parking', True)
+        self.declare_parameter('tunnel_normal_delay_sec', TUNNEL_NORMAL_DELAY_SEC)
+        self.declare_parameter('person_phase_dist', PERSON_PHASE_DIST)
+
+        self.debug             = bool(self.get_parameter('debug').value)
+        self.use_traffic_start = bool(self.get_parameter('enable_traffic_light').value)
+        self.enable_car_follow = bool(self.get_parameter('enable_car_follow').value)
+        self.enable_cone       = bool(self.get_parameter('enable_cone').value)
+        self.enable_tunnel     = bool(self.get_parameter('enable_tunnel').value)
+        self.enable_person     = bool(self.get_parameter('enable_person').value)
+        self.enable_parking    = bool(self.get_parameter('enable_parking').value)
+        self.tunnel_normal_delay_sec = float(self.get_parameter('tunnel_normal_delay_sec').value)
+        self.person_phase_dist = float(self.get_parameter('person_phase_dist').value)
+
+        self.state = 'WAITING_GREEN' if self.use_traffic_start else 'DRIVING'
         self.timer_target = 0.0
 
-        # Car
+        # Car 추종
         self.car_front_dist = None
         self.car_stopped = False
         self.car_log_state = 'none'
@@ -169,34 +189,32 @@ class BehaviorPlannerNode(Node):
         # 신호등
         self.green_seen = False
 
+        # 사람 정지 (1회성): 한 번 발동하면 이후로는 사람 무시
+        self.person_done = False
+
+        # 사람 감지 phase (person_stop 과 별개): 사람이 person_phase_dist 이내면 True
+        self.person_near = False
+
         # Cone Local Waypoint
         self.cone_done = False
-        self.cone_offset_x = 0.0  # 중앙콘 대비 W1의 X 오프셋
-        self.cone_offset_y = 0.0  # 중앙콘 대비 W1의 Y 오프셋
-        self.w1_local = None      # 차량 기준 W1 현재 좌표 (fx, ly)
-
-        # Cone 복구(Recovery) 재생용
-        self.cone_cmd_history = []  # W1까지 주행한 cmd 기록: (dt, vx, wz)
-        self.cone_last_record_t = None
-        self.cone_pending_cmd = None
-        self.w1_min_x = None
-        self.w1_last_progress_t = None
-        self.recovery_index = 0
-        self.recovery_sample_elapsed = 0.0
-        self.recovery_last_t = None
-        self.recovery_start_t = None
-        self.recovery_recorded_t = 0.0
-        self.recovery_w_sign = 0.0
-        self.heading_align_start_t = None
-        self.cone_exit_start_t = None
-        self.last_cone_log_t = 0.0
-        self.current_yaw = None
-        self.cone_start_yaw = None
-        self.cone_target_yaw = None
-        self.cone_pair_yaw_err = None
+        self.cone_offset_x = 0.0   # 중앙콘 대비 W1의 X 오프셋
+        self.cone_offset_y = 0.0   # 중앙콘 대비 W1의 Y 오프셋
+        self.w1_local = None       # 차량 기준 W1 현재 좌표 (fx, ly)
+        self.cone_target = None    # 접근 중 추종할 중앙콘 좌표 (fx, ly)
+        self.cone_escape_dir = 0.0 # W1 통과 후 꺾을 방향 (+1=좌, -1=우)
+        # 탈출 시 방향(좌/우)에 따라 선택되는 활성 파라미터 (_enter_cone_escape에서 세팅)
+        self.esc1_sec = CONE_ESCAPE_SEC_L
+        self.esc1_w = CONE_ESCAPE_W_L
+        self.esc1_speed = CONE_ESCAPE_SPEED_L
+        self.esc2_sec = CONE_ESCAPE2_SEC_L
+        self.esc2_w = CONE_ESCAPE2_W_L
+        self.esc2_speed = CONE_ESCAPE2_SPEED_L
 
         # 터널
         self.tunnel_mid_y = 0.0
+        self.tunnel_enter_sec = 0.0
+        # 터널 중점 조향을 시작하는 시각 (= 진입 + tunnel_normal_delay_sec). 그 전까지는 NORMAL 주행.
+        self.tunnel_center_start_sec = 0.0
 
         # 평행주차
         self.latest_scan = None
@@ -207,21 +225,19 @@ class BehaviorPlannerNode(Node):
         self.parking_replay_elapsed = 0.0
         self.parking_last_t = None
 
-        # phase 발행용
+        # phase 발행용 latch
         self.last_cap = None
         self._cone_was_active = False
-        self.last_curve_latched = False
         self._tunnel_was_active = False
-        self.pre_car_follow_target = None   # 터널 종료 후 PRE_CAR_FOLLOW 만료 시각 (None=비활성)
+        self.last_curve_latched = False
         self.last_curve_start_t = None
+        self.pre_car_follow_target = None   # 터널 종료 후 CAR_FOLLOW 만료 시각 (None=비활성)
 
         self.create_subscription(Twist, SUB_CTRL_CMD, self.cmd_callback, 10)
         self.create_subscription(String, SUB_OBSTACLES, self.obstacle_callback, qos_profile_sensor_data)
-        if CONE_USE_IMU_HEADING:
-            self.create_subscription(Imu, SUB_IMU, self.imu_callback, qos_profile_sensor_data)
-        if USE_TRAFFIC_START:
+        if self.use_traffic_start:
             self.create_subscription(String, SUB_TRAFFIC, self.traffic_callback, 10)
-        if PARKING_ENABLE:
+        if self.enable_parking:
             self.create_subscription(LaserScan, SUB_SCAN, self.scan_callback, qos_profile_sensor_data)
             self.create_subscription(Bool, SUB_LAST_LANE, self.last_lane_callback, 10)
 
@@ -229,20 +245,24 @@ class BehaviorPlannerNode(Node):
         self.phase_pub = self.create_publisher(String, PUB_PHASE, 10)
         self.marker_pub = self.create_publisher(MarkerArray, PUB_WAYPOINT_MARKER, 10)
 
-        self.get_logger().info('Behavior Planner Started (Local Waypoint + Replay Recovery Mode)')
+        self.get_logger().info('Behavior Planner Started (Local Waypoint Mode)')
+        self.get_logger().info(
+            f'[MISSION] traffic_light={self.use_traffic_start} '
+            f'car_follow={self.enable_car_follow} cone={self.enable_cone} '
+            f'tunnel={self.enable_tunnel} person={self.enable_person} '
+            f'parking={self.enable_parking} debug={self.debug}'
+        )
 
     def now_sec(self):
         return self.get_clock().now().nanoseconds * 1e-9
 
     def traffic_callback(self, msg: String):
-        if self.green_seen: return
+        if self.green_seen:
+            return
         if msg.data == 'Green' and self.state == 'WAITING_GREEN':
             self.green_seen = True
             self.state = 'DRIVING'
-            self.get_logger().info('🟢 Green Light Start Driving')
-
-    def imu_callback(self, msg: Imu):
-        self.current_yaw = yaw_from_quaternion(msg.orientation)
+            self.get_logger().info('🟢 Green Light → Driving')
 
     # ============================================================
     #  🅿️ 평행주차 (cmd_vel_record_replay_node.py 통합)
@@ -317,6 +337,9 @@ class BehaviorPlannerNode(Node):
             f'total={total_t:.2f}s'
         )
 
+    # ============================================================
+    #  장애물 콜백 (상태 전이)
+    # ============================================================
     def obstacle_callback(self, msg: String):
         if self.state in ('PARKING_APPROACH', 'PARKING_REPLAY', 'PARKING_DONE'):
             return
@@ -326,58 +349,142 @@ class BehaviorPlannerNode(Node):
             return
 
         self._update_car_follow(obstacles)
+        self._update_person_phase(obstacles)
 
-        # 터널 진입
+        # 터널 진입 (최우선)
         tunnel_active = any(o.get('class') == 'TunnelActive' for o in obstacles)
-        cone_active = self.state in ('CONE_W1', 'CONE_RECOVERY', 'CONE_HEADING_ALIGN', 'CONE_EXIT')
-        if TUNNEL_ENABLE:
-            if tunnel_active and cone_active:
-                self._update_tunnel_mid(obstacles)
-            elif tunnel_active and self.state != 'TUNNEL':
+        if self.enable_tunnel:
+            if tunnel_active and self.state != 'TUNNEL':
                 self.state = 'TUNNEL'
-                self.timer_target = self.now_sec() + TUNNEL_HOLD_SEC
-                self.get_logger().warn('🚇 Tunnel detected → TUNNEL mode')
-
+                self.tunnel_enter_sec = self.now_sec()
+                # 진입 후 delay 동안 NORMAL 유지 → delay 경과 후부터 중점 조향(TUNNEL_HOLD_SEC 만큼)
+                self.tunnel_center_start_sec = self.tunnel_enter_sec + self.tunnel_normal_delay_sec
+                self.timer_target = self.tunnel_center_start_sec + TUNNEL_HOLD_SEC
+                self.get_logger().warn(
+                    f'🚇 Tunnel detected → TUNNEL (NORMAL {self.tunnel_normal_delay_sec:.1f}s 유지 후 중점 조향)'
+                )
             if self.state == 'TUNNEL':
                 self._update_tunnel_mid(obstacles)
                 return
 
-        # 🚧 Cone 미션 (Local) 🚧
-        if CONE_ENABLE and not self.cone_done:
+        # Cone 미션
+        if self.enable_cone and not self.cone_done:
             if self.state == 'DRIVING':
+                # 콘이 처음 보이는 순간(거리 무관) -> 접근 시작
+                self._trigger_cone_approach(obstacles)
+            elif self.state == 'CONE_APPROACH':
+                # 매 프레임 중앙콘 추종 좌표 갱신 + 2개가 AIM_DIST 들어오면 W1 시작
+                self._update_cone_approach(obstacles)
                 self._trigger_cone_mission(obstacles)
             elif self.state == 'CONE_W1':
                 self._update_cone_w1(obstacles)
 
-        # 사람 정지
+        # 사람 정지 (DRIVING 중에만, 코스당 1회만 발동)
+        if not self.enable_person:
+            return
+        if self.person_done:
+            return
         if self.state != 'DRIVING':
             return
-
+        # 앞차 추종(CAR_FOLLOW) 중이면 사람 감지해도 정지하지 않음
+        if self.car_front_dist is not None:
+            return
         for obs in obstacles:
-            if obs.get('class') != PERSON_CLASS: continue
+            if obs.get('class') != PERSON_CLASS:
+                continue
             fx = obs.get('forward_x')
             if fx and 0.0 < fx < PERSON_STOP_DIST:
                 self.state = 'PERSON_STOP'
+                self.person_done = True
                 self.timer_target = self.now_sec() + PERSON_WAIT_SEC
-                self.get_logger().warn(f'Person {fx:.2f}m → wait')
+                self.get_logger().warn(f'Person {fx:.2f}m → wait (1회성, 이후 무시)')
                 break
+
+    def _update_person_phase(self, obstacles):
+        # person_stop(정지) 미션과 별개로, 사람이 person_phase_dist 이내로 들어오면
+        # person_near=True 로 두어 /behavior/phase 를 PERSON 으로 발행하게 한다.
+        # obstacle 목록에 Person 이 하나도 없으면 person_near=False -> NORMAL 복귀.
+        near = False
+        for obs in obstacles:
+            if obs.get('class') != PERSON_CLASS:
+                continue
+            fx = obs.get('forward_x')
+            if fx is not None and 0.0 < fx <= self.person_phase_dist:
+                near = True
+                break
+        self.person_near = near
 
     def _update_tunnel_mid(self, obstacles):
         left_ly, right_ly = None, None
         for o in obstacles:
-            if o.get('class') != 'TunnelWall': continue
-            if o.get('side') == 'left': left_ly = o.get('lateral_y')
-            elif o.get('side') == 'right': right_ly = o.get('lateral_y')
+            if o.get('class') != 'TunnelWall':
+                continue
+            if o.get('side') == 'left':
+                left_ly = o.get('lateral_y')
+            elif o.get('side') == 'right':
+                right_ly = o.get('lateral_y')
 
+        # raw 중점을 먼저 구한 뒤, 모든 분기에 공통으로 오프셋 적용.
+        #   raw = 좌/우 벽 중점 (양벽 없으면 한쪽 벽 기준 근사)
+        #   TUNNEL_CENTER_OFFSET>0 → 중점을 오른쪽(-y)으로 옮겨 로봇이 오른쪽으로 치우쳐 주행
         if left_ly is not None and right_ly is not None:
-            self.tunnel_mid_y = (left_ly + right_ly) / 2.0
-        elif left_ly is not None: self.tunnel_mid_y = left_ly - 0.3
-        elif right_ly is not None: self.tunnel_mid_y = right_ly + 0.3
+            raw = (left_ly + right_ly) / 2.0
+        elif left_ly is not None:
+            raw = left_ly - 0.3
+        elif right_ly is not None:
+            raw = right_ly + 0.3
+        else:
+            return  # 벽이 하나도 없으면 이전 tunnel_mid_y 유지
+
+        # 중점 조향 시작 순간엔 오프셋을 크게 줘서 진입 각을 잡고,
+        # TUNNEL_HOLD_SEC 동안 선형으로 0까지 줄여 중앙 주행으로 복귀.
+        # (NORMAL delay 구간에서는 tunnel_mid_y를 조향에 쓰지 않으므로 elapsed를 0으로 클램프)
+        elapsed = max(0.0, self.now_sec() - self.tunnel_center_start_sec)
+        if elapsed >= TUNNEL_HOLD_SEC or TUNNEL_HOLD_SEC <= 0.0:
+            offset = 0.0
+        else:
+            offset = TUNNEL_CENTER_OFFSET * (1.0 - elapsed / TUNNEL_HOLD_SEC)
+
+        self.tunnel_mid_y = raw - offset
+
+    def _trigger_cone_approach(self, obstacles):
+        # 콘이 2개 이상 보이면 CONE_APPROACH 진입 (거리 조건 없음)
+        # (터널 전 단일 콘 오작동 방지: 콘 갈림길은 항상 2개가 함께 보임)
+        cone_count = 0
+        for obs in obstacles:
+            if obs.get('class') != CONE_CLASS:
+                continue
+            fx = obs.get('forward_x')
+            if fx is not None and fx > 0.0:
+                cone_count += 1
+
+        if cone_count >= 2:
+            self.state = 'CONE_APPROACH'
+            self.get_logger().warn('🚧 Two cones seen → CONE_APPROACH (aim center cone)')
+
+    def _update_cone_approach(self, obstacles):
+        # 접근 중: 가장 가까운 콘(중앙콘)을 추종 목표로 갱신
+        cones = []
+        for obs in obstacles:
+            if obs.get('class') != CONE_CLASS:
+                continue
+            fx = obs.get('forward_x')
+            ly = obs.get('lateral_y')
+            if fx is not None and ly is not None and fx > 0.0:
+                cones.append((math.hypot(fx, ly), fx, ly))
+
+        if not cones:
+            self.cone_target = None
+            return
+        cones.sort(key=lambda c: c[0])
+        _, cx, cy = cones[0]
+        self.cone_target = (cx, cy)
 
     def _trigger_cone_mission(self, obstacles):
         cones = []
         for obs in obstacles:
-            if obs.get('class') != CONE_CLASS: continue
+            if obs.get('class') != CONE_CLASS:
+                continue
             fx = obs.get('forward_x')
             ly = obs.get('lateral_y')
             if fx is not None and ly is not None and 0.0 < fx <= CONE_AIM_DIST:
@@ -386,307 +493,108 @@ class BehaviorPlannerNode(Node):
         if len(cones) < 2:
             return
 
-        # 거리순 정렬: [0]이 가장 가까운 중앙콘, [1]이 측면콘
+        # 거리순 정렬: [0]=중앙콘(가까움), [1]=측면콘
         cones.sort(key=lambda c: c[0])
-        c_dist, cx, cy = cones[0]
-        s_dist, sx, sy = cones[1]
+        _, cx, cy = cones[0]
+        _, sx, sy = cones[1]
 
-        # 측면 콘의 정반대 방향(빈 공간)으로 가기 위한 오프셋 기억
-        # W1 = 2C - S = C + (C - S)
+        # 측면콘 정반대(빈 공간) 방향 오프셋 기억: W1 = 2C - S = C + (C - S)
         self.cone_offset_x = cx - sx
         self.cone_offset_y = cy - sy
-
         self.w1_local = (cx + self.cone_offset_x, cy + self.cone_offset_y)
-        self._update_cone_pair_heading([(cx, cy), (sx, sy)])
+
+        # W1은 측면콘 반대편에 생기므로, 안쪽(콘 쪽) 차선은 offset_y의 반대 방향
+        self.cone_escape_dir = -1.0 if self.cone_offset_y > 0.0 else 1.0
+
         self.state = 'CONE_W1'
         self.timer_target = self.now_sec() + CONE_TIMEOUT_SEC
-        self.car_front_dist = None
-        self.car_stopped = False
-        self.last_cap = None
-        self.pre_car_follow_target = None
-        self.cone_cmd_history = []
-        self.cone_last_record_t = None
-        self.cone_pending_cmd = None
-        self.w1_min_x = self.w1_local[0]
-        self.w1_last_progress_t = self.now_sec()
-        self.cone_start_yaw = self.current_yaw
-        yaw_text = 'none' if self.cone_start_yaw is None else f'{self.cone_start_yaw:+.2f}rad'
-        cone_yaw_text = 'none' if self.cone_pair_yaw_err is None else f'{self.cone_pair_yaw_err:+.2f}rad'
+        side = 'LEFT' if self.cone_escape_dir > 0 else 'RIGHT'
+        # 콘-콘 거리(중앙콘↔측면콘) 와 콘-W1 거리(중앙콘↔W1)
+        cone_cone_dist = math.hypot(cx - sx, cy - sy)
+        cone_w1_dist = math.hypot(self.w1_local[0] - cx, self.w1_local[1] - cy)
         self.get_logger().warn(
-            f'🚧 Cone Trigger! W1=({self.w1_local[0]:.2f},{self.w1_local[1]:+.2f}), '
-            f'offset=({self.cone_offset_x:.2f},{self.cone_offset_y:+.2f}), '
-            f'start_yaw={yaw_text}, cone_yaw={cone_yaw_text}'
+            f'🚧 Cone Trigger! escape={side} | '
+            f'콘-콘 거리={cone_cone_dist:.2f}m | 중앙콘-W1 거리={cone_w1_dist:.2f}m'
         )
 
     def _update_cone_w1(self, obstacles):
-        """매 프레임마다 중앙 콘의 위치를 다시 찾고 W1 좌표를 최신화"""
+        # 매 프레임 중앙콘 위치를 다시 찾아 W1 갱신
         cones = []
         for obs in obstacles:
-            if obs.get('class') != CONE_CLASS: continue
+            if obs.get('class') != CONE_CLASS:
+                continue
             fx = obs.get('forward_x')
             ly = obs.get('lateral_y')
             if fx is not None and ly is not None:
                 cones.append((math.hypot(fx, ly), fx, ly))
 
         if not cones:
-            # 콘이 시야에서 아예 사라지면 미션 완료로 간주 (지나쳤다고 판단)
-            self._start_cone_recovery('cones lost')
+            # 콘이 시야에서 사라짐 -> 통과로 간주
+            self._enter_cone_escape('Cones lost (passed)')
             return
 
-        # 가장 가까운 콘(중앙콘)의 위치를 지속적으로 추적
         cones.sort(key=lambda c: c[0])
-        c_dist, cx, cy = cones[0]
-        self._update_cone_pair_heading([(fx, ly) for _, fx, ly in cones[:2]])
+        _, cx, cy = cones[0]
 
-        if cx < CONE_PASS_DIST:
-            self._start_cone_recovery(f'center cone passed fx={cx:.2f}')
+        # 좌/우 갈림길에 따라 통과 판정 거리 선택 (escape_dir>0=LEFT=_L, <0=RIGHT=_R)
+        pass_dist = CONE_PASS_DIST_L if self.cone_escape_dir > 0 else CONE_PASS_DIST_R
+        if cx < pass_dist:
+            self._enter_cone_escape('Passed Center Cone')
+            return
+
+        self.w1_local = (cx + self.cone_offset_x, cy + self.cone_offset_y)
+
+        # 디버깅(0.3s throttle): 콘-콘 거리(현재 두 콘) + 중앙콘-W1 거리
+        cone_w1_dist = math.hypot(self.w1_local[0] - cx, self.w1_local[1] - cy)
+        if len(cones) >= 2:
+            _, sx, sy = cones[1]
+            cone_cone_dist = math.hypot(cx - sx, cy - sy)
+            cc_txt = f'콘-콘 거리={cone_cone_dist:.2f}m'
         else:
-            # 실시간으로 중앙콘 위치에 기억해둔 오프셋을 더해 W1 갱신
-            self.w1_local = (cx + self.cone_offset_x, cy + self.cone_offset_y)
-            self._check_w1_done('scan update')
+            cc_txt = '콘-콘 거리=N/A(콘 1개만 보임)'
+        self.get_logger().info(
+            f'[CONE_W1] {cc_txt} | 중앙콘-W1 거리={cone_w1_dist:.2f}m',
+            throttle_duration_sec=0.3,
+        )
 
-    def _check_w1_done(self, source):
-        if self.state != 'CONE_W1' or self.w1_local is None:
-            return False
-
-        t = self.now_sec()
-        wx = self.w1_local[0]
-        if wx <= CONE_W1_PASS_DIST:
-            self._start_cone_recovery(f'W1 passed {source} x={wx:.2f}')
-            return True
-
-        if self.w1_min_x is None or wx < self.w1_min_x - CONE_W1_PROGRESS_EPS:
-            self.w1_min_x = wx
-            self.w1_last_progress_t = t
-            return False
-
-        if self.w1_last_progress_t is not None and t - self.w1_last_progress_t >= CONE_W1_STUCK_SEC:
-            self._start_cone_recovery(
-                f'W1 no progress {source} x={wx:.2f}, min_x={self.w1_min_x:.2f}'
-            )
-            return True
-
-        return False
-
-    def _cone_pair_heading_error_from_points(self, p0, p1):
-        if not CONE_USE_PAIR_HEADING:
-            return None
-
-        x0, y0 = p0
-        x1, y1 = p1
-        dx = x1 - x0
-        dy = y1 - y0
-        sep = math.hypot(dx, dy)
-        if sep < CONE_PAIR_HEADING_MIN_SEP or sep > CONE_PAIR_HEADING_MAX_SEP:
-            return None
-
-        # 두 콘을 잇는 선에 수직인 두 방향 중 차량 전방(+x)을 향하는 쪽을 진행 방향으로 본다.
-        hx = dy
-        hy = -dx
-        if hx < 0.0:
-            hx = -hx
-            hy = -hy
-        if hx <= 1e-6:
-            return None
-
-        yaw_err = math.atan2(hy, hx)
-        if abs(yaw_err) > CONE_PAIR_HEADING_MAX_ABS:
-            return None
-        return yaw_err
-
-    def _update_cone_pair_heading(self, points):
-        if len(points) < 2 or self.current_yaw is None:
-            return
-
-        yaw_err = self._cone_pair_heading_error_from_points(points[0], points[1])
-        if yaw_err is None:
-            return
-
-        target_yaw = normalize_angle(self.current_yaw + yaw_err)
-        if self.cone_target_yaw is None:
-            self.cone_target_yaw = target_yaw
-        else:
-            prev_err = normalize_angle(target_yaw - self.cone_target_yaw)
-            self.cone_target_yaw = normalize_angle(
-                self.cone_target_yaw + CONE_PAIR_HEADING_ALPHA * prev_err
-            )
-        self.cone_pair_yaw_err = normalize_angle(self.cone_target_yaw - self.current_yaw)
-
-    def _record_cone_cmd(self, t, cmd):
-        if self.cone_last_record_t is None:
-            self.cone_last_record_t = t
-            self.cone_pending_cmd = (float(cmd.linear.x), float(cmd.angular.z))
-            return
-
-        dt = max(0.0, t - self.cone_last_record_t)
-        if dt > 0.3:
-            dt = 0.3
-
-        if self.cone_pending_cmd is not None and dt > 1e-3:
-            vx, wz = self.cone_pending_cmd
-            self.cone_cmd_history.append((dt, vx, wz))
-
-        self.cone_last_record_t = t
-        self.cone_pending_cmd = (float(cmd.linear.x), float(cmd.angular.z))
-
-    def _finalize_cone_cmd_history(self, t):
-        if self.cone_last_record_t is None or self.cone_pending_cmd is None:
-            return
-
-        dt = max(0.0, t - self.cone_last_record_t)
-        if dt > 0.3:
-            dt = 0.3
-        if dt > 1e-3:
-            vx, wz = self.cone_pending_cmd
-            self.cone_cmd_history.append((dt, vx, wz))
-
-        self.cone_last_record_t = None
-        self.cone_pending_cmd = None
-
-    def _recorded_cone_cmd_count(self):
-        if self.cone_pending_cmd is None:
-            return len(self.cone_cmd_history)
-        else:
-            return len(self.cone_cmd_history) + 1
-
-    def _recovery_sign_from_history(self):
-        for _dt, _vx, wz in self.cone_cmd_history:
-            if abs(wz) >= CONE_RECOVERY_SIGN_MIN_W:
-                return -1.0 if wz > 0.0 else 1.0
-        return 0.0
-
-    def _recovery_w_from_sample(self, wz):
-        if CONE_RECOVERY_SIGN_LOCK and self.recovery_w_sign != 0.0:
-            scale = CONE_RECOVERY_LEFT_SCALE if self.recovery_w_sign > 0.0 else CONE_RECOVERY_RIGHT_SCALE
-            return self.recovery_w_sign * abs(wz) * CONE_RECOVERY_W_SCALE * scale
-
-        base_w = -wz * CONE_RECOVERY_W_SCALE
-        scale = CONE_RECOVERY_LEFT_SCALE if base_w > 0.0 else CONE_RECOVERY_RIGHT_SCALE
-        return base_w * scale
-
-    def _start_cone_recovery(self, reason):
-        self._finalize_cone_cmd_history(self.now_sec())
-        self.state = 'CONE_RECOVERY'
+    def _enter_cone_escape(self, reason: str):
+        # W1 도달 -> 안쪽 차선으로 강하게 꺾어 짧게 주행 (1차 탈출)
+        self.state = 'CONE_ESCAPE'
         self.cone_done = True
         self.w1_local = None
-        self.w1_min_x = None
-        self.w1_last_progress_t = None
-        self.recovery_index = 0
-        self.recovery_sample_elapsed = 0.0
-        now = self.now_sec()
-        self.recovery_last_t = None
-        self.recovery_start_t = now
-        self.timer_target = now + CONE_RECOVERY_MAX_SEC
+        self.cone_target = None
+        # 방향(좌/우)에 따라 1차/2차 탈출 파라미터 세팅
+        if self.cone_escape_dir > 0:  # 왼쪽 길 (LEFT)
+            self.esc1_sec, self.esc1_w, self.esc1_speed = \
+                CONE_ESCAPE_SEC_L, CONE_ESCAPE_W_L, CONE_ESCAPE_SPEED_L
+            self.esc2_sec, self.esc2_w, self.esc2_speed = \
+                CONE_ESCAPE2_SEC_L, CONE_ESCAPE2_W_L, CONE_ESCAPE2_SPEED_L
+        else:  # 오른쪽 길 (RIGHT)
+            self.esc1_sec, self.esc1_w, self.esc1_speed = \
+                CONE_ESCAPE_SEC_R, CONE_ESCAPE_W_R, CONE_ESCAPE_SPEED_R
+            self.esc2_sec, self.esc2_w, self.esc2_speed = \
+                CONE_ESCAPE2_SEC_R, CONE_ESCAPE2_W_R, CONE_ESCAPE2_SPEED_R
+        self.timer_target = self.now_sec() + self.esc1_sec
+        side = 'LEFT' if self.cone_escape_dir > 0 else 'RIGHT'
+        self.get_logger().warn(f'✅ {reason} → CONE_ESCAPE (turn {side})')
 
-        total_t = sum(dt for dt, _, _ in self.cone_cmd_history)
-        self.recovery_recorded_t = total_t
-        self.recovery_w_sign = self._recovery_sign_from_history()
-        sign_text = 'none' if self.recovery_w_sign == 0.0 else ('left' if self.recovery_w_sign > 0.0 else 'right')
-        self.get_logger().warn(
-            f'✅ Cone W1 done ({reason}) → RECOVERY replay '
-            f'samples={len(self.cone_cmd_history)}, recorded_t={total_t:.2f}s, '
-            f'recovery_dir={sign_text}'
-        )
-
-    def _start_cone_heading_align(self, reason, yaw_err, recovery_elapsed, replay_ratio):
-        yaw_text = 'none' if yaw_err is None else f'{yaw_err:+.2f}rad'
-        if yaw_err is None:
-            self._finish_cone_mission(
-                f'no heading ({reason})',
-                yaw_text,
-                recovery_elapsed,
-                replay_ratio
-            )
-            return
-        if abs(yaw_err) <= CONE_HEADING_TOL:
-            self._finish_cone_mission(
-                f'heading already aligned ({reason})',
-                yaw_text,
-                recovery_elapsed,
-                replay_ratio
-            )
-            return
-
-        self.state = 'CONE_HEADING_ALIGN'
-        self.recovery_last_t = None
-        self.recovery_start_t = None
-        self.heading_align_start_t = self.now_sec()
-        self.timer_target = self.heading_align_start_t + CONE_HEADING_ALIGN_MAX_SEC
-        self.get_logger().info(
-            f'Cone replay done ({reason}, yaw_err={yaw_text}, '
-            f'elapsed={recovery_elapsed:.2f}s, replay={replay_ratio:.2f}) → HEADING_ALIGN'
-        )
-
-    def _finish_cone_mission(self, reason, yaw_text, elapsed, replay_ratio):
-        self.state = 'CONE_EXIT'
-        self.cone_cmd_history = []
-        self.cone_last_record_t = None
-        self.cone_pending_cmd = None
-        self.w1_min_x = None
-        self.w1_last_progress_t = None
-        self.recovery_last_t = None
-        self.recovery_start_t = None
-        self.recovery_recorded_t = 0.0
-        self.recovery_w_sign = 0.0
-        self.heading_align_start_t = None
-        self.cone_exit_start_t = self.now_sec()
-        self.timer_target = self.cone_exit_start_t + CONE_EXIT_MAX_SEC
-        self.get_logger().info(
-            f'✅ Cone recovery done ({reason}, yaw_err={yaw_text}, '
-            f'elapsed={elapsed:.2f}s, replay={replay_ratio:.2f}) → cone exit hold'
-        )
-
-    def _finish_cone_exit(self, reason):
-        self.state = 'DRIVING'
-        self.cone_start_yaw = None
-        self.cone_target_yaw = None
-        self.cone_pair_yaw_err = None
-        self.cone_exit_start_t = None
-        self.get_logger().info(f'✅ Cone exit done ({reason}) → lane following')
-
-    def _cone_heading_error(self):
-        if not CONE_USE_IMU_HEADING:
-            return None
-        if self.current_yaw is None:
-            return None
-        if CONE_USE_PAIR_HEADING and self.cone_target_yaw is not None:
-            self.cone_pair_yaw_err = normalize_angle(self.cone_target_yaw - self.current_yaw)
-            return self.cone_pair_yaw_err
-        if self.cone_start_yaw is None:
-            return None
-        return normalize_angle(self.cone_start_yaw - self.current_yaw)
-
-    def _cone_heading_source(self):
-        if CONE_USE_PAIR_HEADING and self.cone_target_yaw is not None:
-            return 'cone_pair'
-        return 'start_yaw'
-
-    def _cone_heading_correction(self):
-        yaw_err = self._cone_heading_error()
-        if yaw_err is None:
-            return 0.0
-        return clamp(CONE_HEADING_K * yaw_err, -CONE_HEADING_WMAX, CONE_HEADING_WMAX)
-
-    def _cone_exit_heading_correction(self):
-        yaw_err = self._cone_heading_error()
-        if yaw_err is None:
-            return 0.0
-        return clamp(CONE_HEADING_K * yaw_err, -CONE_EXIT_WMAX, CONE_EXIT_WMAX)
-
-    def _debug_cone_log(self, t, msg):
-        if t - self.last_cone_log_t < CONE_LOG_SEC:
-            return
-        self.last_cone_log_t = t
-        self.get_logger().info(msg)
-
+    # ============================================================
+    #  Car 추종 속도 캡
+    # ============================================================
     def _update_car_follow(self, obstacles):
+        if not self.enable_car_follow:
+            self.car_front_dist = None
+            return
         nearest = None
         for obs in obstacles:
-            if obs.get('class') != CAR_CLASS: continue
+            if obs.get('class') != CAR_CLASS:
+                continue
             fx = obs.get('forward_x')
             ly = obs.get('lateral_y')
-            if fx is None or ly is None: continue
-            if fx <= 0.0 or abs(ly) > CAR_GATE_LAT: continue
+            if fx is None or ly is None:
+                continue
+            if fx <= 0.0 or abs(ly) > CAR_GATE_LAT:
+                continue
             if nearest is None or fx < nearest:
                 nearest = fx
         self.car_front_dist = nearest
@@ -698,8 +606,10 @@ class BehaviorPlannerNode(Node):
             return None
 
         if self.car_stopped:
-            if d > CAR_RESUME_DIST: self.car_stopped = False
-            else: return 0.0
+            if d > CAR_RESUME_DIST:
+                self.car_stopped = False
+            else:
+                return 0.0
         elif d < CAR_STOP_DIST:
             self.car_stopped = True
             return 0.0
@@ -712,9 +622,27 @@ class BehaviorPlannerNode(Node):
             return CAR_MID_SPEED + frac * (CAR_MAX_CAP - CAR_MID_SPEED)
         return None
 
+    def _apply_car_cap(self, cmd: Twist):
+        cap = self._car_speed_cap()
+        self.last_cap = cap
+        if cap is None:
+            self.car_log_state = 'none'
+        elif cap == 0.0:
+            self.car_log_state = 'stop'
+        else:
+            self.car_log_state = 'cap'
+
+        if cap is not None and cmd.linear.x > cap:
+            if cmd.linear.x > 1e-3:
+                cmd.angular.z *= (cap / cmd.linear.x)
+            cmd.linear.x = cap
+        return cmd
+
+    # ============================================================
+    #  RViz 마커
+    # ============================================================
     def _publish_waypoint_markers(self):
         marker_array = MarkerArray()
-        current_time = self.get_clock().now().to_msg()
 
         delete_all = Marker()
         delete_all.action = Marker.DELETEALL
@@ -724,10 +652,9 @@ class BehaviorPlannerNode(Node):
             self.marker_pub.publish(marker_array)
             return
 
-        # W1 마커 (초록색) - 레이저 프레임 기준
         m1 = Marker()
         m1.header.frame_id = 'laser_link'
-        m1.header.stamp = current_time
+        m1.header.stamp = self.get_clock().now().to_msg()
         m1.ns = 'waypoints'
         m1.id = 1
         m1.type = Marker.SPHERE
@@ -742,16 +669,26 @@ class BehaviorPlannerNode(Node):
 
         self.marker_pub.publish(marker_array)
 
+    # ============================================================
+    #  제어 콜백 (상태별 게이팅 후 /cmd_vel 발행)
+    # ============================================================
     def cmd_callback(self, ctrl_msg: Twist):
         t = self.now_sec()
         out = Twist()
 
-        if PARKING_ENABLE and self.state == 'DRIVING' and self.last_lane_detected \
+        if self.enable_parking and self.state == 'DRIVING' and self.last_lane_detected \
                 and self.last_curve_latched and not self.parking_triggered:
             self._start_parking_approach()
 
         self._publish_phase()
         self._publish_waypoint_markers()
+
+        if self.debug:
+            self.get_logger().info(
+                f'[DEBUG] state={self.state} in(v={ctrl_msg.linear.x:.2f}, '
+                f'w={ctrl_msg.angular.z:.2f}) car_d={self.car_front_dist} cap={self.last_cap}',
+                throttle_duration_sec=1.0,
+            )
 
         if self.state == 'WAITING_GREEN':
             self.cmd_pub.publish(out)
@@ -812,182 +749,76 @@ class BehaviorPlannerNode(Node):
         if self.state == 'TUNNEL':
             if t >= self.timer_target:
                 self.state = 'DRIVING'
-                self.get_logger().info('🚇 Tunnel end (time) → lane following')
-                out = self._apply_car_cap(ctrl_msg)
-                self.cmd_pub.publish(out)
+                self.get_logger().info('🚇 Tunnel end → lane following')
+                self.cmd_pub.publish(self._apply_car_cap(ctrl_msg))
                 return
-            w = clamp(TUNNEL_GAIN * self.tunnel_mid_y, -TUNNEL_WMAX, TUNNEL_WMAX)
+            if t < self.tunnel_center_start_sec:
+                # 진입 후 tunnel_normal_delay_sec 동안은 중점 조향 대신 기존 NORMAL(Stanley) 주행 유지
+                self.cmd_pub.publish(self._apply_car_cap(ctrl_msg))
+                return
             out.linear.x = TUNNEL_SPEED
-            out.angular.z = w
-            out = self._apply_car_cap(out)
-            self.cmd_pub.publish(out)
+            out.angular.z = clamp(TUNNEL_GAIN * self.tunnel_mid_y, -TUNNEL_WMAX, TUNNEL_WMAX)
+            self.cmd_pub.publish(self._apply_car_cap(out))
             return
 
-        # ============================================================
-        # 🚧 Cone 미션 조향 제어 (W1 추종)
-        # ============================================================
+        # Cone 접근: 중앙콘을 향해 조향, 속도는 stanley 그대로 (+car_cap)
+        if self.state == 'CONE_APPROACH':
+            if self.cone_target is not None:
+                out.angular.z = clamp(
+                    CONE_AIM_GAIN * self.cone_target[1], -CONE_AIM_WMAX, CONE_AIM_WMAX
+                )
+            else:
+                out.angular.z = 0.0
+            out.linear.x = ctrl_msg.linear.x
+            self.cmd_pub.publish(self._apply_car_cap(out))
+            return
+
+        # Cone 미션: W1 추종
         if self.state == 'CONE_W1':
             if t > self.timer_target:
-                self._start_cone_recovery('W1 timeout')
-                self.cmd_pub.publish(out)
+                self.state = 'DRIVING'
+                self.cone_done = True
+                self.get_logger().warn('🚧 Cone Mission Timeout!')
+                self.cmd_pub.publish(self._apply_car_cap(ctrl_msg))
                 return
 
             if self.w1_local is not None:
-                if self._check_w1_done('cmd loop'):
-                    self.cmd_pub.publish(out)
-                    return
-
-                # 계산된 W1의 가상 측면 오차(ly)를 향해 조향
+                # W1의 가상 측면 오차(ly)를 향해 조향, 조향 클수록 감속
                 w = clamp(CONE_AIM_GAIN * self.w1_local[1], -CONE_AIM_WMAX, CONE_AIM_WMAX)
-
-                # 조향각(w)의 크기에 비례하여 속도를 부드럽게 감속 (직진=MAX, 최대조향=MIN)
                 steer_ratio = abs(w) / CONE_AIM_WMAX
-                current_speed = CONE_SPEED_MAX - steer_ratio * (CONE_SPEED_MAX - CONE_SPEED_MIN)
-
-                out.linear.x = current_speed
+                out.linear.x = CONE_SPEED_MAX - steer_ratio * (CONE_SPEED_MAX - CONE_SPEED_MIN)
                 out.angular.z = w
             else:
                 out.linear.x = CONE_SPEED_MAX
                 out.angular.z = 0.0
-
-            self._record_cone_cmd(t, out)
-            self._debug_cone_log(
-                t,
-                f'cone W1: target=({self.w1_local[0]:.2f},{self.w1_local[1]:+.2f}) '
-                f'cmd_v={out.linear.x:.2f}, cmd_w={out.angular.z:+.2f}, '
-                f'record_n={self._recorded_cone_cmd_count()}'
-                if self.w1_local is not None else
-                f'cone W1: target=None cmd_v={out.linear.x:.2f}, cmd_w={out.angular.z:+.2f}'
-            )
             self.cmd_pub.publish(out)
             return
 
-        if self.state == 'CONE_RECOVERY':
-            if self.recovery_last_t is None:
-                dt = 0.0
-                self.recovery_last_t = t
+        # Cone 1차 탈출: 안쪽 차선 쪽으로 고정 조향 -> 만료 시 2차 탈출로 전환
+        if self.state == 'CONE_ESCAPE':
+            if t >= self.timer_target:
+                self.state = 'CONE_ESCAPE2'
+                self.timer_target = t + self.esc2_sec
+                side2 = 'LEFT' if self.cone_escape_dir < 0 else 'RIGHT'
+                self.get_logger().info(f'✅ Cone escape1 done → CONE_ESCAPE2 (turn {side2})')
+                # 전환 즉시 2차 탈출 명령 발행 (아래 블록으로 fall-through)
             else:
-                dt = max(0.0, t - self.recovery_last_t)
-                self.recovery_last_t = t
-            self.recovery_sample_elapsed += dt
-
-            while self.recovery_index < len(self.cone_cmd_history):
-                sample_dt = self.cone_cmd_history[self.recovery_index][0]
-                if sample_dt <= 1e-3:
-                    self.recovery_index += 1
-                    continue
-                if self.recovery_sample_elapsed <= sample_dt:
-                    break
-                self.recovery_sample_elapsed -= sample_dt
-                self.recovery_index += 1
-
-            yaw_err = self._cone_heading_error()
-            replay_done = self.recovery_index >= len(self.cone_cmd_history)
-            timeout = t >= self.timer_target
-            recovery_elapsed = 0.0 if self.recovery_start_t is None else t - self.recovery_start_t
-            replay_ratio = 1.0
-            if self.cone_cmd_history:
-                replay_ratio = self.recovery_index / float(len(self.cone_cmd_history))
-            replay_time = min(
-                self.recovery_recorded_t,
-                sum(dt for dt, _, _ in self.cone_cmd_history[:self.recovery_index]) +
-                self.recovery_sample_elapsed
-            )
-
-            if replay_done or (timeout and not self.cone_cmd_history):
-                yaw_text = 'none' if yaw_err is None else f'{yaw_err:+.2f}rad'
-                reason = 'timeout' if timeout and not replay_done else 'replay done'
-                if replay_done:
-                    self._start_cone_heading_align(reason, yaw_err, recovery_elapsed, replay_ratio)
-                    if self.state == 'CONE_HEADING_ALIGN':
-                        out.linear.x = CONE_HEADING_SPEED
-                        out.angular.z = self._cone_heading_correction()
-                    else:
-                        out = self._apply_car_cap(ctrl_msg)
-                else:
-                    self._finish_cone_mission(reason, yaw_text, recovery_elapsed, replay_ratio)
-                    out = self._apply_car_cap(ctrl_msg)
+                out.linear.x = self.esc1_speed
+                out.angular.z = self.cone_escape_dir * self.esc1_w
                 self.cmd_pub.publish(out)
                 return
 
-            heading_corr = self._cone_heading_correction()
-            _, vx, wz = self.cone_cmd_history[self.recovery_index]
-            out.linear.x = vx * CONE_RECOVERY_SPEED_SCALE
-            if CONE_RECOVERY_PURE_REPLAY:
-                out.angular.z = clamp(
-                    self._recovery_w_from_sample(wz),
-                    -CONE_AIM_WMAX,
-                    CONE_AIM_WMAX
-                )
-            else:
-                out.angular.z = clamp(
-                    self._recovery_w_from_sample(wz) + heading_corr,
-                    -CONE_AIM_WMAX,
-                    CONE_AIM_WMAX
-                )
-
-            yaw_text = 'none' if yaw_err is None else f'{yaw_err:+.2f}'
-            self._debug_cone_log(
-                t,
-                f'cone RECOVERY: idx={self.recovery_index}/{len(self.cone_cmd_history)}, '
-                f'yaw_err={yaw_text}, heading_src={self._cone_heading_source()}, '
-                f'replay={replay_ratio:.2f}, replay_t={replay_time:.2f}/{self.recovery_recorded_t:.2f}s, '
-                f'raw_w={wz:+.2f}, cmd_v={out.linear.x:.2f}, cmd_w={out.angular.z:+.2f}'
-            )
-            self.cmd_pub.publish(out)
-            return
-
-        if self.state == 'CONE_HEADING_ALIGN':
-            yaw_err = self._cone_heading_error()
-            elapsed = 0.0 if self.heading_align_start_t is None else t - self.heading_align_start_t
-            timeout = t >= self.timer_target
-            yaw_text = 'none' if yaw_err is None else f'{yaw_err:+.2f}rad'
-
-            if yaw_err is None or abs(yaw_err) <= CONE_HEADING_TOL or timeout:
-                reason = 'heading timeout' if timeout and yaw_err is not None and abs(yaw_err) > CONE_HEADING_TOL else 'heading aligned'
-                self._finish_cone_mission(reason, yaw_text, elapsed, 1.0)
-                out = self._apply_car_cap(ctrl_msg)
-                self.cmd_pub.publish(out)
+        # Cone 2차 탈출: 반대로 꺾어 유지 -> 만료 시 DRIVING 복귀 (→ LAST_CURVE)
+        if self.state == 'CONE_ESCAPE2':
+            if t >= self.timer_target:
+                self.state = 'DRIVING'
+                self.get_logger().info('✅ Cone escape2 done → DRIVING')
+                self.cmd_pub.publish(self._apply_car_cap(ctrl_msg))
                 return
-
-            out.linear.x = CONE_HEADING_SPEED
-            out.angular.z = self._cone_heading_correction()
-            self._debug_cone_log(
-                t,
-                f'cone HEADING_ALIGN: yaw_err={yaw_text}, '
-                f'heading_src={self._cone_heading_source()}, '
-                f'cmd_v={out.linear.x:.2f}, cmd_w={out.angular.z:+.2f}'
-            )
+            out.linear.x = self.esc2_speed
+            out.angular.z = -self.cone_escape_dir * self.esc2_w
             self.cmd_pub.publish(out)
             return
-
-        if self.state == 'CONE_EXIT':
-            yaw_err = self._cone_heading_error()
-            yaw_text = 'none' if yaw_err is None else f'{yaw_err:+.2f}rad'
-            elapsed = 0.0 if self.cone_exit_start_t is None else t - self.cone_exit_start_t
-            min_hold_done = elapsed >= CONE_EXIT_HOLD_SEC
-            yaw_ready = yaw_err is None or abs(yaw_err) <= CONE_EXIT_TOL
-            timeout = t >= self.timer_target
-            if (min_hold_done and yaw_ready) or timeout:
-                if timeout and not yaw_ready:
-                    reason = f'hold timeout, yaw_err={yaw_text}'
-                else:
-                    reason = f'hold done, yaw_err={yaw_text}'
-                self._finish_cone_exit(reason)
-                out = self._apply_car_cap(ctrl_msg)
-                self.cmd_pub.publish(out)
-                return
-
-            out.linear.x = CONE_EXIT_SPEED
-            out.angular.z = self._cone_exit_heading_correction()
-            self._debug_cone_log(
-                t,
-                f'cone EXIT: yaw_err={yaw_text}, heading_src={self._cone_heading_source()}, '
-                f'elapsed={elapsed:.2f}s, cmd_v={out.linear.x:.2f}, cmd_w={out.angular.z:+.2f}'
-            )
-            self.cmd_pub.publish(out)
-            return
-        # ============================================================
 
         if self.state == 'PERSON_STOP':
             if t >= self.timer_target:
@@ -1004,18 +835,22 @@ class BehaviorPlannerNode(Node):
             if t >= self.timer_target:
                 self.state = 'DRIVING'
                 self.get_logger().info('Normal Driving')
-            out = self._apply_car_cap(ctrl_msg)
-            self.cmd_pub.publish(out)
+            self.cmd_pub.publish(self._apply_car_cap(ctrl_msg))
             return
 
         # 일반 주행 (Stanley 기반)
-        out = self._apply_car_cap(ctrl_msg)
-        self.cmd_pub.publish(out)
+        self.cmd_pub.publish(self._apply_car_cap(ctrl_msg))
 
+    # ============================================================
+    #  phase 발행
+    #    CONE_APPROACH / CONE_W1 / CONE_ESCAPE / CONE_ESCAPE2 -> CONE
+    #    TUNNEL -> TUNNEL
+    #    그 외 -> PRE_CAR_FOLLOW창 / 앞차 / LAST_CURVE latch / PERSON(사람 근접) / NORMAL
+    # ============================================================
     def _publish_phase(self):
         if self.state in ('PARKING_APPROACH', 'PARKING_REPLAY', 'PARKING_DONE'):
             phase = 'PARKING'
-        elif self.state in ('CONE_W1', 'CONE_RECOVERY', 'CONE_HEADING_ALIGN', 'CONE_EXIT'):
+        elif self.state in ('CONE_APPROACH', 'CONE_W1', 'CONE_ESCAPE', 'CONE_ESCAPE2'):
             phase = 'CONE'
             self._cone_was_active = True
         elif self.state == 'TUNNEL':
@@ -1027,60 +862,36 @@ class BehaviorPlannerNode(Node):
                 self.last_curve_start_t = self.now_sec()
                 self._cone_was_active = False
             if self._tunnel_was_active:
-                # 터널 종료 순간 → 필요할 때만 PRE_CAR_FOLLOW 발동
-                if PRE_CAR_FOLLOW_SEC > 0.0:
-                    self.pre_car_follow_target = self.now_sec() + PRE_CAR_FOLLOW_SEC
-                else:
-                    self.pre_car_follow_target = None
+                # 터널 종료 순간 -> PRE_CAR_FOLLOW 발동 (CAR_FOLLOW 동일 동작)
+                self.pre_car_follow_target = self.now_sec() + PRE_CAR_FOLLOW_SEC
                 self._tunnel_was_active = False
 
-            if self.pre_car_follow_target is not None and \
-                    self.now_sec() < self.pre_car_follow_target:
-                # PRE_CAR_FOLLOW 창: 설정 시간 동안 무조건 CAR_FOLLOW (앞차 없어도 유지)
+            if self.pre_car_follow_target is not None and self.now_sec() < self.pre_car_follow_target:
+                # PRE_CAR_FOLLOW 창: 앞차 없어도 CAR_FOLLOW 유지
                 phase = 'CAR_FOLLOW'
             elif self.last_cap is not None:
-                # 실제 앞차 추종 → CAR_FOLLOW (PRE_CAR_FOLLOW 창 안팎 동일)
+                # 실제 앞차 추종
                 self.pre_car_follow_target = None
                 phase = 'CAR_FOLLOW'
             elif self.last_curve_latched:
                 self.pre_car_follow_target = None
-                # [테스트용] LAST_CURVE 진입 후 LAST_CURVE_TEST_TIMEOUT_SEC 지나면 강제로 NORMAL 복귀
+                # [테스트용] 일정 시간 후 강제 NORMAL 복귀 + 콘 미션 재무장
                 if self.now_sec() - self.last_curve_start_t >= LAST_CURVE_TEST_TIMEOUT_SEC:
                     self.last_curve_latched = False
                     self.last_curve_start_t = None
-                    # [테스트용] 콘 미션도 다시 트리거 가능하도록 원상 복구
                     self.cone_done = False
                     self.w1_local = None
                     phase = 'NORMAL'
                 else:
                     phase = 'LAST_CURVE'
             else:
-                # PRE_CAR_FOLLOW 4초 경과 & 앞차 없음 → NORMAL 복귀
                 self.pre_car_follow_target = None
-                phase = 'NORMAL'
+                # 사람이 person_phase_dist 이내면 NORMAL 대신 PERSON 발행 (사라지면 NORMAL 복귀)
+                phase = 'PERSON' if self.person_near else 'NORMAL'
 
         msg = String()
         msg.data = phase
         self.phase_pub.publish(msg)
-
-    def _apply_car_cap(self, cmd: Twist):
-        cap = self._car_speed_cap()
-        self.last_cap = cap
-        if cap is None:
-            if self.car_log_state != 'none':
-                self.car_log_state = 'none'
-        elif cap == 0.0:
-            if self.car_log_state != 'stop':
-                self.car_log_state = 'stop'
-        else:
-            if self.car_log_state != 'cap':
-                self.car_log_state = 'cap'
-
-        if cap is not None and cmd.linear.x > cap:
-            if cmd.linear.x > 1e-3:
-                cmd.angular.z *= (cap / cmd.linear.x)
-            cmd.linear.x = cap
-        return cmd
 
 
 def main(args=None):
@@ -1092,10 +903,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        try:
-            rclpy.shutdown()
-        except RCLError:
-            pass
+        rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

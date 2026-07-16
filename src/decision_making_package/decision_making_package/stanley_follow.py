@@ -12,7 +12,7 @@ from rclpy.qos import qos_profile_sensor_data
 
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import CompressedImage, Image
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 
 
 class LaneFollow(Node):
@@ -30,35 +30,65 @@ class LaneFollow(Node):
         self.declare_parameter('white_lower', [0, 0, 190])
         self.declare_parameter('white_upper', [180, 20, 255])
         self.declare_parameter('tophat_enable', True)
-        self.declare_parameter('tophat_kernel_size', 31)
+        self.declare_parameter('tophat_kernel_size', 40)
         self.declare_parameter('tophat_thresh', 30)
         self.declare_parameter('min_lane_pixels', 30)
+        # base 탐색: 안쪽(중앙)부터 바깥으로 스캔해 임계값 넘는 첫 피크를 차선 base로 선택
+        self.declare_parameter('inner_base_search', True)      # False면 기존 argmax 방식
+        self.declare_parameter('base_peak_ratio', 0.5)         # 각 절반 최댓값 대비 피크 인정 비율
+        self.declare_parameter('base_min_sum', 1500.0)         # 히스토그램 열 합 절대 하한(≈6px)
+        self.declare_parameter('base_peak_margin', 15)         # 선택 피크 중심 보정 반경(px)
 
         # ===== 제어 (Stanley / 속도) =====
         self.declare_parameter('steer_k', 0.002)
         self.declare_parameter('yaw_k', 1.0)
         self.declare_parameter('max_steer', 0.6)
         self.declare_parameter('steer_smoothing_alpha', 0.35)
-        self.declare_parameter('steer_slowdown_ratio', 0.35)
+        self.declare_parameter('steer_slowdown_ratio', 0.0)
         self.declare_parameter('min_smooth_speed', 0.45)
 
         # ===== 차선 기하 (공통) =====
-        self.declare_parameter('lane_width_px', 250.0)
+        self.declare_parameter('lane_width_px', 290.0)
         self.declare_parameter('min_lane_overlap_px', 50.0)
-        self.declare_parameter('narrow_both_gap_px', 220.0)
+        self.declare_parameter('narrow_both_gap_px', 250.0)
         self.declare_parameter('single_lane_track_alpha', 0.80)
         self.declare_parameter('lane_width_update_alpha', 0.10)
 
         # ===== NORMAL 전용 =====
         self.declare_parameter('normal_single_lane_pos_angle_deg', 10.0)  # |각도|<이 값이면 최하단 x위치로 좌/우 판정
 
+        # ===== PERSON 전용 =====
+        # 기본 주행은 NORMAL 과 동일하되, 차선 중점을 왼쪽으로 이 값[px]만큼 이동시켜
+        # 차량이 왼쪽에 붙어 주행하도록 한다 (0이면 NORMAL 과 동일).
+        self.declare_parameter('person_center_offset_px', 60.0)
+
         # ===== CAR_FOLLOW(로터리) 전용 =====
         self.declare_parameter('car_follow_hold_sec', 3.0)               # phase 이탈 후 유지 시간
-        self.declare_parameter('car_follow_max_speed', 0.7)              # 속도 상한
-        self.declare_parameter('car_follow_gap_thresh_px', 230.0)        # 2차선 간격: 미만이면 좁음
-        self.declare_parameter('car_follow_lane_width_px', 120.0)        # 단일차선 시 가상 반대차선 간격
+        self.declare_parameter('car_follow_max_speed', 1.0)              # 속도 상한
+        self.declare_parameter('car_follow_gap_thresh_px', 250.0)        # 2차선 간격: 미만이면 좁음
+        self.declare_parameter('car_follow_lane_width_px', 150.0)        # 차선 미검출(직진 폴백) 시 가상 차폭
+        self.declare_parameter('car_follow_lane_width_left_px',450.0)   # 왼쪽 차선만 검출 시 가상 우측차선 오프셋(차폭)
+        self.declare_parameter('car_follow_lane_width_right_px', 150.0)  # 오른쪽 차선만 검출 시 가상 좌측차선 오프셋(차폭)
         self.declare_parameter('car_follow_single_lane_pos_angle_deg', 7.0)  # |각도|<이 값이면 최하단 x위치로 좌/우 판정
         self.declare_parameter('car_follow_drop_angle_deg', 10.0)        # 이 각도 이상 우측기울이면 차선 삭제
+
+        # ===== LAST_CURVE 전용 =====
+        self.declare_parameter('last_curve_max_speed', 1.0)              # 속도 상한
+        self.declare_parameter('last_curve_single_lane_pos_angle_deg', 7.0)  # |각도|<이 값이면 최하단 x위치로 좌/우 판정
+        self.declare_parameter('last_curve_topdown', False)              # 위->아래 윈도우 진행
+        self.declare_parameter('last_curve_topdown_seed_band', 0.5)     # 상단 시드 밴드 비율(상단 이 비율만큼 누적)
+        self.declare_parameter('last_curve_window_margin', 20)          # 윈도우 반폭(px). 창 넓이 = 2*margin
+        # LAST_CURVE 우편향: 단일차선 검출 시 가상 반대차선까지의 오프셋(차폭)을 좌/우로 구분.
+        #   left-only -> 넓게(중심 오른쪽), right-only -> 좁게(중심 오른쪽). both는 두 값에서 자동 유도.
+        self.declare_parameter('last_curve_lane_width_left_px', 340.0)   # left-only 가상차폭 (우편향 25px)
+        self.declare_parameter('last_curve_lane_width_right_px', 240.0)  # right-only 가상차폭 (우편향 25px)
+
+        # ===== LAST_LANE 진입 트리거 (가로 정지선 감지, BEV 이진화 이미지 기반) =====
+        self.declare_parameter('stopline_row_ratio_thresh', 0.4)   # 한 행이 이 비율 이상 흰 픽셀이면 "가로줄"로 카운트
+        self.declare_parameter('stopline_min_rows', 3)              # 가로줄로 카운트된 행이 이만큼 있어야 후보로 인정
+        self.declare_parameter('stopline_confirm_frames', 1)        # 이 프레임 연속 후보여야 최종 확정(latch)
+        self.declare_parameter('stopline_detect_delay_sec', 3.0)    # LAST_CURVE 진입 후 이 시간 동안 정지선 감지 억제
+        self.declare_parameter('last_lane_speed', 0.3)              # 확정 후 속도 상한 (last_curve_max_speed보다 우선)
 
         # ---- 파라미터 읽기 ----
         self.img_width = int(self.get_parameter('img_width').value)
@@ -71,6 +101,10 @@ class LaneFollow(Node):
         self.tophat_kernel_size = int(self.get_parameter('tophat_kernel_size').value)
         self.tophat_thresh = int(self.get_parameter('tophat_thresh').value)
         self.min_lane_pixels = int(self.get_parameter('min_lane_pixels').value)
+        self.inner_base_search = bool(self.get_parameter('inner_base_search').value)
+        self.base_peak_ratio = float(self.get_parameter('base_peak_ratio').value)
+        self.base_min_sum = float(self.get_parameter('base_min_sum').value)
+        self.base_peak_margin = int(self.get_parameter('base_peak_margin').value)
 
         self.steer_k = float(self.get_parameter('steer_k').value)
         self.yaw_k = float(self.get_parameter('yaw_k').value)
@@ -87,12 +121,30 @@ class LaneFollow(Node):
 
         self.normal_single_lane_pos_angle_deg = float(self.get_parameter('normal_single_lane_pos_angle_deg').value)
 
+        self.person_center_offset_px = float(self.get_parameter('person_center_offset_px').value)
+
         self.car_follow_hold_sec = float(self.get_parameter('car_follow_hold_sec').value)
         self.car_follow_max_speed = float(self.get_parameter('car_follow_max_speed').value)
         self.car_follow_gap_thresh_px = float(self.get_parameter('car_follow_gap_thresh_px').value)
         self.car_follow_lane_width_px = float(self.get_parameter('car_follow_lane_width_px').value)
+        self.car_follow_lane_width_left_px = float(self.get_parameter('car_follow_lane_width_left_px').value)
+        self.car_follow_lane_width_right_px = float(self.get_parameter('car_follow_lane_width_right_px').value)
         self.car_follow_single_lane_pos_angle_deg = float(self.get_parameter('car_follow_single_lane_pos_angle_deg').value)
         self.car_follow_drop_angle_deg = float(self.get_parameter('car_follow_drop_angle_deg').value)
+
+        self.last_curve_max_speed = float(self.get_parameter('last_curve_max_speed').value)
+        self.last_curve_single_lane_pos_angle_deg = float(self.get_parameter('last_curve_single_lane_pos_angle_deg').value)
+        self.last_curve_topdown = bool(self.get_parameter('last_curve_topdown').value)
+        self.last_curve_topdown_seed_band = float(self.get_parameter('last_curve_topdown_seed_band').value)
+        self.last_curve_window_margin = int(self.get_parameter('last_curve_window_margin').value)
+        self.last_curve_lane_width_left_px = float(self.get_parameter('last_curve_lane_width_left_px').value)
+        self.last_curve_lane_width_right_px = float(self.get_parameter('last_curve_lane_width_right_px').value)
+
+        self.stopline_row_ratio_thresh = float(self.get_parameter('stopline_row_ratio_thresh').value)
+        self.stopline_min_rows = int(self.get_parameter('stopline_min_rows').value)
+        self.stopline_confirm_frames = int(self.get_parameter('stopline_confirm_frames').value)
+        self.stopline_detect_delay_sec = float(self.get_parameter('stopline_detect_delay_sec').value)
+        self.last_lane_speed = float(self.get_parameter('last_lane_speed').value)
 
         self.tophat_kernel = cv.getStructuringElement(
             cv.MORPH_ELLIPSE, (self.tophat_kernel_size, self.tophat_kernel_size)
@@ -105,12 +157,17 @@ class LaneFollow(Node):
         self.inv_warp_mat = cv.getPerspectiveTransform(self.dst_points, self.src_points)
 
         # ---- phase 상태 ----
+        # sticky phase: 진입하면 planner가 전송을 멈춰도 hold_sec 동안 유지 (CAR_FOLLOW 전용)
         self.latest_behavior_phase = 'NORMAL'
         self.behavior_phase = 'NORMAL'
-        self.car_follow_latched = False
-        self.car_follow_last_seen_sec = None
+        self.sticky_phase = None
+        self.sticky_last_seen_sec = None
+        self.hold_sec_by_phase = {
+            'CAR_FOLLOW': self.car_follow_hold_sec,
+        }
 
         # ---- 런타임 상태 ----
+        self.center_bias_px = 0.0   # 중심선 우편향 오프셋[px] (LAST_CURVE both 전용, 매 프레임 갱신)
         self.bgr = None
         self.warp_img0 = None
         self.filtered_img = None
@@ -121,12 +178,19 @@ class LaneFollow(Node):
         self.angular_velocity = 0.0
         self.prev_steer = None
         self.cmd_speed = 0.0
+        self.final_cmd_speed = 0.0   # state_machine이 게이팅해서 발행하는 최종 /cmd_vel linear.x
         self.prev_lfit = None
         self.prev_rfit = None
         self.last_lane_status = 'none'
         self.narrow_both_active = False
         self.narrow_both_gap = 0.0
-        self.car_follow_lane_debug = 'off'
+        self.both_lane_gap_px = 0.0
+        self.special_lane_debug = 'off'
+
+        # ---- LAST_LANE(가로 정지선) 감지 상태 ----
+        self.stopline_hit_streak = 0
+        self.last_lane_triggered = False   # 한번 확정되면 계속 유지 (sticky)
+        self.last_curve_enter_sec = None   # LAST_CURVE 최초 진입 시각 (정지선 감지 억제 타이머용)
 
         # ---- I/O ----
         self.phase_sub = self.create_subscription(
@@ -137,10 +201,15 @@ class LaneFollow(Node):
             self.image_cb, qos_profile_sensor_data,
         )
         self.cmd_vel_pub = self.create_publisher(Twist, '/stanley/cmd_vel', 10)
+        # state_machine이 게이팅 후 발행하는 최종 /cmd_vel (표시용, 스칼라라서 부하 미미)
+        self.final_cmd_sub = self.create_subscription(
+            Twist, '/cmd_vel', self.final_cmd_cb, 10
+        )
         self.roi_img_pub = self.create_publisher(Image, '/roi_img', 10)
         self.binary_img_pub = self.create_publisher(Image, '/binary_img', 10)
         self.debug_publisher1 = self.create_publisher(Image, '/debugging_image1', 10)
         self.debug_publisher2 = self.create_publisher(Image, '/debugging_image2', 10)
+        self.last_lane_pub = self.create_publisher(Bool, '/lane/last_lane_detected', 10)
 
         self.timer = None
         if start_timer:
@@ -166,33 +235,39 @@ class LaneFollow(Node):
             bgr = cv.resize(bgr, (self.img_width, self.img_height))
         self.bgr = bgr
 
+    def final_cmd_cb(self, msg):
+        # state_machine 최종 /cmd_vel의 속력만 저장 (표시용)
+        self.final_cmd_speed = float(msg.linear.x)
+
     def phase_cb(self, msg):
         self.latest_behavior_phase = msg.data
-        if msg.data == 'CAR_FOLLOW':
-            self.car_follow_latched = True
-            self.car_follow_last_seen_sec = self.get_clock().now().nanoseconds * 1e-9
-            self.behavior_phase = 'CAR_FOLLOW'
+        if msg.data in self.hold_sec_by_phase:
+            self.sticky_phase = msg.data
+            self.sticky_last_seen_sec = self.get_clock().now().nanoseconds * 1e-9
+            self.behavior_phase = msg.data
             return
-        self._update_car_follow_hold()
+        self._update_sticky_hold()
 
-    def _update_car_follow_hold(self):
-        # CAR_FOLLOW 이탈 후에도 hold_sec 동안 CAR_FOLLOW 유지 (NORMAL/CONE 무관)
-        if not self.car_follow_latched:
+    def _update_sticky_hold(self):
+        # sticky phase 이탈 후에도 hold_sec 동안 유지 (다른 phase 무관)
+        if self.sticky_phase is None:
             self.behavior_phase = self.latest_behavior_phase
             return
 
         now_sec = self.get_clock().now().nanoseconds * 1e-9
-        if self.car_follow_last_seen_sec is None:
-            self.car_follow_last_seen_sec = now_sec
+        if self.sticky_last_seen_sec is None:
+            self.sticky_last_seen_sec = now_sec
 
-        if now_sec - self.car_follow_last_seen_sec >= self.car_follow_hold_sec:
-            self.car_follow_latched = False
+        hold_sec = self.hold_sec_by_phase[self.sticky_phase]
+        if now_sec - self.sticky_last_seen_sec >= hold_sec:
+            expired = self.sticky_phase
+            self.sticky_phase = None
             self.behavior_phase = (
-                'NORMAL' if self.latest_behavior_phase == 'CAR_FOLLOW'
+                'NORMAL' if self.latest_behavior_phase == expired
                 else self.latest_behavior_phase
             )
         else:
-            self.behavior_phase = 'CAR_FOLLOW'
+            self.behavior_phase = self.sticky_phase
 
     # ============================================================
     #  전처리
@@ -241,11 +316,32 @@ class LaneFollow(Node):
     def fit_angle_deg(fit):
         return math.degrees(math.atan(float(fit[0])))
 
+    def _curve_lane_mode(self):
+        # LAST_CURVE 및 그 직후 PARKING 구간에서 동일한 차선 계산 로직을 사용한다.
+        return self.behavior_phase in ('LAST_CURVE', 'PARKING')
+
+    def _single_lane_pos_angle_deg(self):
+        # phase별 단일차선 pos 판정 각도 임계값
+        if self._curve_lane_mode():
+            return self.last_curve_single_lane_pos_angle_deg
+        return self.normal_single_lane_pos_angle_deg
+
+    def _last_curve_lane_width(self, side):
+        # LAST_CURVE 단일차선 검출 시 가상 반대차선 오프셋(차폭). 우편향용으로 좌/우 비대칭.
+        if side == 'left':
+            return self.last_curve_lane_width_left_px
+        return self.last_curve_lane_width_right_px
+
+    def _last_curve_both_bias_px(self):
+        # both일 때 중심선을 오른쪽으로 미는 양[px]. 단일차선(left/right) 우편향과 대칭이 되도록
+        # 두 가상차폭의 절반 위치를 평균한 값에서 유도: (Lw/2 - Rw/2)/2 = (Lw - Rw)/4.
+        return (self.last_curve_lane_width_left_px - self.last_curve_lane_width_right_px) / 4.0
+
     def classify_single_lane(self, fit, img_h, img_w):
-        # NORMAL: |각도|<threshold면 최하단 x위치, 아니면 기울기 부호로 좌/우 판정
+        # NORMAL/LAST_CURVE: |각도|<threshold면 최하단 x위치, 아니면 기울기 부호로 좌/우 판정
         slope = float(fit[0])
         angle = self.fit_angle_deg(fit)
-        if abs(angle) < self.normal_single_lane_pos_angle_deg:
+        if abs(angle) < self._single_lane_pos_angle_deg():
             x_bottom = float(self.fit_x(fit, [img_h - 1])[0])
             return 'left' if x_bottom < img_w / 2.0 else 'right'
         if slope > 0.0:
@@ -295,8 +391,71 @@ class LaneFollow(Node):
                 np.array([0.0, lane_center + half]))
 
     # ============================================================
+    #  LAST_LANE 진입 트리거 (가로 정지선 감지)
+    #    슬라이딩 윈도우가 찾는 좌/우 차선(세로에 가까운 얇은 두 줄)과 달리,
+    #    가로 정지선은 이미지 폭 전체에 걸쳐 흰 픽셀이 깔린 행(row)이 여러 줄 나온다.
+    #    노이즈 방지로 stopline_confirm_frames 연속 감지돼야 최종 확정(latch)한다.
+    # ============================================================
+    def _detect_stop_line(self, img):
+        if img is None or img.shape[0] == 0 or img.shape[1] == 0:
+            return False
+        row_white = np.count_nonzero(img > 0, axis=1)
+        row_ratio = row_white / float(img.shape[1])
+        hit_rows = int(np.sum(row_ratio >= self.stopline_row_ratio_thresh))
+        return hit_rows >= self.stopline_min_rows
+
+    def _update_last_lane_trigger(self, img):
+        if self.last_lane_triggered:
+            self.last_lane_pub.publish(Bool(data=True))
+            return
+
+        # 가로 정지선 감지는 반드시 LAST_CURVE phase 에서만 수행한다.
+        # (원형 교차로 등 다른 구간의 전폭 흰 픽셀 오검출 방지)
+        if self.behavior_phase != 'LAST_CURVE':
+            self.stopline_hit_streak = 0
+            self.last_curve_enter_sec = None
+            self.last_lane_pub.publish(Bool(data=False))
+            return
+
+        # LAST_CURVE 진입 직후 stopline_detect_delay_sec 동안은 정지선 감지를 억제한다.
+        # (진입 순간에 남아있는 전폭 흰 픽셀로 인한 조기 오검출 방지)
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+        if self.last_curve_enter_sec is None:
+            self.last_curve_enter_sec = now_sec
+        if now_sec - self.last_curve_enter_sec < self.stopline_detect_delay_sec:
+            self.stopline_hit_streak = 0
+            self.last_lane_pub.publish(Bool(data=False))
+            return
+
+        img = self.binary_filter(self.white_color_filter_hsv(img))
+
+        if self._detect_stop_line(img):
+            self.stopline_hit_streak += 1
+        else:
+            self.stopline_hit_streak = 0
+
+        if self.stopline_hit_streak >= self.stopline_confirm_frames:
+            self.last_lane_triggered = True
+            self.get_logger().warn(
+                f'🛑 가로 정지선 감지 → LAST_LANE 진입, 속도 {self.last_lane_speed}로 제한'
+            )
+
+        self.last_lane_pub.publish(Bool(data=self.last_lane_triggered))
+
+    # ============================================================
     #  제어
     # ============================================================
+    def _phase_max_speed(self):
+        # LAST_LANE(가로 정지선) 확정 후에는 다른 phase보다 우선해서 속도 제한
+        if self.last_lane_triggered:
+            return self.last_lane_speed
+        # 현재 behavior_phase의 속도 상한. 상한 없는 phase면 None
+        if self.behavior_phase == 'CAR_FOLLOW':
+            return self.car_follow_max_speed
+        if self.behavior_phase == 'LAST_CURVE':
+            return self.last_curve_max_speed
+        return None
+
     def cal_steering(self, yaw, error):
         base_speed = 1.0
         wheelbase = 0.23
@@ -312,17 +471,25 @@ class LaneFollow(Node):
             steering_angle = raw_steering_angle
         else:
             steering_delta = raw_steering_angle - self.prev_steer
-            alpha = float(np.clip(self.steer_smoothing_alpha, 0.0, 1.0))
-            steering_angle = float(np.clip(
-                self.prev_steer + alpha * steering_delta, -self.max_steer, self.max_steer
-            ))
+            if self.behavior_phase == 'CAR_FOLLOW':
+                # CAR_FOLLOW: 이전 조향 기반 스무딩(EMA, alpha=steer_smoothing_alpha) 적용
+                alpha = float(np.clip(self.steer_smoothing_alpha, 0.0, 1.0))
+                steering_angle = float(np.clip(
+                    self.prev_steer + alpha * steering_delta, -self.max_steer, self.max_steer
+                ))
+            else:
+                # 그 외 phase: 스무딩 없이 raw 조향 사용 (현재 동작 유지)
+                steering_angle = float(np.clip(
+                    raw_steering_angle, -self.max_steer, self.max_steer
+                ))
 
         steer_change_ratio = min(abs(steering_delta) / max(abs(self.max_steer), 0.01), 1.0)
         speed_scale = 1.0 - self.steer_slowdown_ratio * steer_change_ratio
         base_speed = max(base_speed * speed_scale, self.min_smooth_speed)
 
-        if self.behavior_phase == 'CAR_FOLLOW':
-            base_speed = min(base_speed, self.car_follow_max_speed)
+        max_speed = self._phase_max_speed()
+        if max_speed is not None:
+            base_speed = min(base_speed, max_speed)
 
         self.steer = steering_angle
         self.prev_steer = steering_angle
@@ -341,16 +508,23 @@ class LaneFollow(Node):
         else:
             h, w = 160, self.img_width
         a, b = cfit
-        x_center = a * (h * 0.9) + b
+        # center_bias_px>0 이면 목표 중심을 오른쪽으로 이동 -> 차량이 오른쪽에 붙어 주행 (LAST_CURVE both)
+        x_center = a * (h * 0.9) + b + self.center_bias_px
         yaw = np.arctan(a)
         error = -x_center + w / 2.0
         return yaw, error
 
     # ============================================================
-    #  CAR_FOLLOW(로터리) 전용 차선 선택
+    #  CAR_FOLLOW(로터리) 차선 선택
     #    2개: 좁으면 화면상 왼쪽 / 넓으면 오른쪽 -> 1개로 축약
     #    1개: |각도|<pos -> 최하단 x위치, 우측 급기울 -> 삭제, 그 외 -> 오른쪽
     # ============================================================
+    def _car_follow_lane_width(self, side):
+        # 단일차선 검출 시 가상 반대차선까지의 오프셋(차폭)을 좌/우로 구분
+        if side == 'left':
+            return self.car_follow_lane_width_left_px
+        return self.car_follow_lane_width_right_px
+
     def _car_follow_lane_select(self, candidates, img_h, img):
         img_w = img.shape[1]
 
@@ -364,10 +538,10 @@ class LaneFollow(Node):
 
             if gap < self.car_follow_gap_thresh_px:
                 keep = candidates[0] if xa <= xb else candidates[1]
-                self.car_follow_lane_debug = f'2->1 narrow gap={gap:.0f} keep left-pos'
+                self.special_lane_debug = f'2->1 narrow gap={gap:.0f} keep left-pos'
             else:
                 keep = candidates[0] if xa >= xb else candidates[1]
-                self.car_follow_lane_debug = f'2->1 wide gap={gap:.0f} keep right'
+                self.special_lane_debug = f'2->1 wide gap={gap:.0f} keep right'
             candidates = [keep]
 
         if len(candidates) == 1:
@@ -377,37 +551,48 @@ class LaneFollow(Node):
             if abs(angle_deg) < self.car_follow_single_lane_pos_angle_deg:
                 x_bottom = float(self.fit_x(candidate, [img_h - 1])[0])
                 side = 'left' if x_bottom < img_w / 2.0 else 'right'
-                lfit, rfit = self.update_single_lane_track(candidate, side, self.car_follow_lane_width_px)
+                lfit, rfit = self.update_single_lane_track(candidate, side, self._car_follow_lane_width(side))
                 self.last_lane_status = f'car_follow_{side}'
-                self.car_follow_lane_debug += f' | POS {side} x={x_bottom:.0f}'
+                self.special_lane_debug += f' | POS {side} x={x_bottom:.0f}'
                 return lfit, rfit
             if angle_deg <= -self.car_follow_drop_angle_deg:
-                self.car_follow_lane_debug += f' | DROP right {angle_deg:.1f}deg'
+                self.special_lane_debug += f' | DROP right {angle_deg:.1f}deg'
             else:
-                lfit, rfit = self.update_single_lane_track(candidate, 'right', self.car_follow_lane_width_px)
+                lfit, rfit = self.update_single_lane_track(candidate, 'right', self._car_follow_lane_width('right'))
                 self.last_lane_status = 'car_follow_right'
-                self.car_follow_lane_debug += f' | SET right {angle_deg:.1f}deg'
+                self.special_lane_debug += f' | SET right {angle_deg:.1f}deg'
                 return lfit, rfit
 
         # 차선 없음 -> 이전 값 유지, 없으면 직진
         if self.prev_lfit is not None and self.prev_rfit is not None:
             self.last_lane_status = 'car_follow_hold'
-            if self.car_follow_lane_debug == 'off':
-                self.car_follow_lane_debug = 'no lane -> hold'
+            if self.special_lane_debug == 'off':
+                self.special_lane_debug = 'no lane -> hold'
             return self.prev_lfit.copy(), self.prev_rfit.copy()
 
         self.last_lane_status = 'car_follow_straight'
-        if self.car_follow_lane_debug == 'off':
-            self.car_follow_lane_debug = 'no lane -> straight'
+        if self.special_lane_debug == 'off':
+            self.special_lane_debug = 'no lane -> straight'
         return self._default_lane(img_w, self.car_follow_lane_width_px)
 
     # ============================================================
     #  NORMAL 차선 선택
     # ============================================================
     def _normal_lane_select(self, candidates, img_h, img_w):
+        # LAST_CURVE 모드에서만 lane 선택 근거를 special_lane_debug에 기록해
+        # /debugging_image2 오버레이로 발행한다.
+        record = self._curve_lane_mode()
+
+        def note(text):
+            if record:
+                self.special_lane_debug = text
+
+        n_in = len(candidates)
         if len(candidates) == 2:
-            if self.fit_distance(candidates[0][0], candidates[1][0], img_h) < self.min_lane_overlap_px:
+            merge_gap = self.fit_distance(candidates[0][0], candidates[1][0], img_h)
+            if merge_gap < self.min_lane_overlap_px:
                 candidates = [max(candidates, key=lambda c: c[1])]
+                note(f'2->1 overlap gap={merge_gap:.0f}<{self.min_lane_overlap_px:.0f} keep max-px')
 
         if len(candidates) == 2:
             fit_a = np.asarray(candidates[0][0], dtype=float)
@@ -421,27 +606,55 @@ class LaneFollow(Node):
             lane_width = self.fit_distance(lfit, rfit, img_h)
             if lane_width >= self.narrow_both_gap_px:
                 self.last_lane_status = 'both'
+                self.both_lane_gap_px = lane_width
+                if self._curve_lane_mode():
+                    # both일 때는 실측 중심을 유지하되, 중심선을 오른쪽으로 편향(단일차선 400/180과 대칭)
+                    self.center_bias_px = self._last_curve_both_bias_px()
+                    note(f'BOTH(LAST_CURVE) gap={lane_width:.0f} L&R by x@0.8 '
+                         f'bias+{self.center_bias_px:.0f}px->right')
+                else:
+                    note(f'BOTH gap={lane_width:.0f}>={self.narrow_both_gap_px:.0f} L&R by x@0.8')
                 self.update_both_lane_track(lfit, rfit, img_h, img_w)
                 return lfit, rfit
 
             if lane_width >= self.min_lane_overlap_px:
-                # both지만 간격이 좁음 -> 다수 후보 기울기로 좌/우 재판정
+                # both지만 간격이 좁음
                 self.narrow_both_active = True
                 self.narrow_both_gap = lane_width
-                slope = float(np.asarray(max(candidates, key=lambda c: c[1])[0], dtype=float)[0])
-                if slope > 0.0:
-                    side, candidate = 'right', lfit
-                elif slope < 0.0:
-                    side, candidate = 'left', rfit
+                if self._curve_lane_mode():
+                    # LAST_CURVE NARROW_BOTH: 왼쪽으로 기운(기울기 최대·양수) 차선만 남기고 나머지 버림.
+                    # 남긴 차선을 우측 차선으로 두고 왼쪽으로 오프셋해 가상 좌측차선 생성.
+                    slope_l = float(np.asarray(lfit, dtype=float)[0])
+                    slope_r = float(np.asarray(rfit, dtype=float)[0])
+                    if slope_l >= slope_r:
+                        candidate, kept = np.asarray(lfit, dtype=float), 'L'
+                    else:
+                        candidate, kept = np.asarray(rfit, dtype=float), 'R'
+                    side = 'right'
+                    note(f'NARROW_BOTH(LAST_CURVE) gap={lane_width:.0f}<{self.narrow_both_gap_px:.0f} '
+                         f'keep left-tilt({kept}) slopeL={slope_l:+.3f} slopeR={slope_r:+.3f} -> right')
                 else:
-                    side, candidate = None, None
+                    # NORMAL: 다수 후보 기울기 부호로 좌/우 재판정
+                    slope = float(np.asarray(max(candidates, key=lambda c: c[1])[0], dtype=float)[0])
+                    if slope > 0.0:
+                        side, candidate = 'right', lfit
+                    elif slope < 0.0:
+                        side, candidate = 'left', rfit
+                    else:
+                        side, candidate = None, None
+                    note(f'NARROW_BOTH gap={lane_width:.0f}<{self.narrow_both_gap_px:.0f} '
+                         f'slope={slope:+.3f}->{side}')
             else:
                 candidate = max(candidates, key=lambda c: c[1])[0]
                 side = self.classify_single_lane(candidate, img_h, img_w)
+                note(f'SINGLE(2cand) width={lane_width:.0f}<{self.min_lane_overlap_px:.0f} '
+                     f'classify->{side}')
 
             if side is None:
+                note('AMBIGUOUS side=None -> fallback')
                 return self._fallback_lane(img_w)
-            lfit, rfit = self.update_single_lane_track(candidate, side)
+            lc_w = self._last_curve_lane_width(side) if self._curve_lane_mode() else None
+            lfit, rfit = self.update_single_lane_track(candidate, side, lc_w)
             self.last_lane_status = (
                 f'narrow_both_{side}' if self.narrow_both_active else f'tracked_{side}_only'
             )
@@ -450,17 +663,23 @@ class LaneFollow(Node):
         if len(candidates) == 1:
             candidate = np.asarray(candidates[0][0], dtype=float)
             side = self.classify_single_lane(candidate, img_h, img_w)
+            angle = self.fit_angle_deg(candidate)
+            note(f'SINGLE(1cand) angle={angle:+.1f}deg classify->{side}')
             if side is None:
+                note(f'SINGLE(1cand) angle={angle:+.1f}deg side=None -> fallback')
                 return self._fallback_lane(img_w)
-            lfit, rfit = self.update_single_lane_track(candidate, side)
+            lc_w = self._last_curve_lane_width(side) if self._curve_lane_mode() else None
+            lfit, rfit = self.update_single_lane_track(candidate, side, lc_w)
             self.last_lane_status = f'tracked_{side}_only'
             return lfit, rfit
 
         if self.prev_lfit is not None and self.prev_rfit is not None:
             self.last_lane_status = 'previous'
+            note(f'NO lane(cand={n_in}) -> hold previous')
             return self.prev_lfit.copy(), self.prev_rfit.copy()
 
         self.last_lane_status = 'default'
+        note(f'NO lane(cand={n_in}) -> default straight')
         return self._default_lane(img_w, self.lane_width_px)
 
     def _fallback_lane(self, img_w):
@@ -469,52 +688,118 @@ class LaneFollow(Node):
             return self.prev_lfit.copy(), self.prev_rfit.copy()
         return self._default_lane(img_w, self.lane_width_px)
 
-    # ============================================================
-    #  슬라이딩 윈도우
-    # ============================================================
-    def sliding_window(self, img, n_windows=10, margin=12, minpix=5):
-        self._update_car_follow_hold()
-        self.narrow_both_active = False
-        self.car_follow_lane_debug = 'off'
-        car_follow = self.behavior_phase == 'CAR_FOLLOW'
+    def _search_base_inner(self, histogram, lo, hi, from_inner_right):
+        """[lo, hi) 구간에서 안쪽(중앙)부터 바깥으로 스캔해 임계값을 넘는
+        첫 피크의 x 좌표를 반환. 유효 피크가 없으면 기존 argmax로 폴백."""
+        seg = np.asarray(histogram[lo:hi], dtype=float)
+        if seg.size == 0 or seg.max() <= 0:
+            return int(np.argmax(seg)) + lo if seg.size else lo
+        thresh = max(seg.max() * self.base_peak_ratio, self.base_min_sum)
+        idxs = np.where(seg >= thresh)[0]
+        if idxs.size == 0:
+            return int(np.argmax(seg)) + lo
+        start = int(idxs[-1]) if from_inner_right else int(idxs[0])  # 안쪽부터 첫 피크
+        a = max(0, start - self.base_peak_margin)
+        b = min(seg.size, start + self.base_peak_margin + 1)
+        return int(np.argmax(seg[a:b])) + a + lo                     # 피크 중심으로 보정
 
+    def _scan_bottom_up(self, img, nz, out_img, n_windows, margin, minpix):
+        # 아래(가까운 쪽)에서 시드 -> 위로 진행 (기본 방식)
         y = img.shape[0]
         histogram = np.sum(img[y // 2:, :], axis=0)
         midpoint = int(histogram.shape[0] / 2)
-        leftx_current = int(np.argmax(histogram[:midpoint]))
-        rightx_current = int(np.argmax(histogram[midpoint:]) + midpoint)
+        if self.inner_base_search:
+            leftx_current = self._search_base_inner(histogram, 0, midpoint, from_inner_right=True)
+            rightx_current = self._search_base_inner(histogram, midpoint, histogram.shape[0], from_inner_right=False)
+        else:
+            leftx_current = int(np.argmax(histogram[:midpoint]))
+            rightx_current = int(np.argmax(histogram[midpoint:]) + midpoint)
 
         window_height = int(y / n_windows)
-        nz = img.nonzero()
-        left_lane_inds = []
-        right_lane_inds = []
-        out_img = cv.cvtColor(img, cv.COLOR_GRAY2BGR)
-
+        left_lane_inds, right_lane_inds = [], []
         for window in range(n_windows):
             win_yl = y - (window + 1) * window_height
             win_yh = y - window * window_height
             win_xll, win_xlh = leftx_current - margin, leftx_current + margin
             win_xrl, win_xrh = rightx_current - margin, rightx_current + margin
-
             cv.rectangle(out_img, (win_xll, win_yl), (win_xlh, win_yh), (0, 255, 0), 2)
             cv.rectangle(out_img, (win_xrl, win_yl), (win_xrh, win_yh), (0, 255, 0), 2)
-
             good_left_inds = (
                 (nz[0] >= win_yl) & (nz[0] < win_yh) & (nz[1] >= win_xll) & (nz[1] < win_xlh)
             ).nonzero()[0]
             good_right_inds = (
                 (nz[0] >= win_yl) & (nz[0] < win_yh) & (nz[1] >= win_xrl) & (nz[1] < win_xrh)
             ).nonzero()[0]
-
             left_lane_inds.append(good_left_inds)
             right_lane_inds.append(good_right_inds)
             if len(good_left_inds) > minpix:
                 leftx_current = int(np.mean(nz[1][good_left_inds]))
             if len(good_right_inds) > minpix:
                 rightx_current = int(np.mean(nz[1][good_right_inds]))
+        return np.concatenate(left_lane_inds), np.concatenate(right_lane_inds)
 
-        left_lane_inds = np.concatenate(left_lane_inds)
-        right_lane_inds = np.concatenate(right_lane_inds)
+    def _scan_top_down(self, img, nz, out_img, n_windows, margin, minpix):
+        # LAST_CURVE 전용: 위(먼 쪽)에서 시드 -> 아래로 진행. 진행 방향만 반대이고
+        # 차선 선택 판단은 기존 _normal_lane_select 를 그대로 사용한다.
+        y = img.shape[0]
+        band_h = max(1, int(y * self.last_curve_topdown_seed_band))
+        top_hist = np.sum(img[:band_h, :], axis=0)
+        midpoint = int(top_hist.shape[0] / 2)
+        if self.inner_base_search:
+            # 왼쪽 절반은 안쪽(오른쪽)부터, 오른쪽 절반은 안쪽(왼쪽)부터 탐색
+            leftx_current = self._search_base_inner(top_hist, 0, midpoint, from_inner_right=True)
+            rightx_current = self._search_base_inner(top_hist, midpoint, top_hist.shape[0], from_inner_right=False)
+        else:
+            leftx_current = int(np.argmax(top_hist[:midpoint]))
+            rightx_current = int(np.argmax(top_hist[midpoint:]) + midpoint)
+
+        window_height = int(y / n_windows)
+        left_lane_inds, right_lane_inds = [], []
+        for window in range(n_windows):
+            win_yl = window * window_height
+            win_yh = (window + 1) * window_height
+            win_xll, win_xlh = leftx_current - margin, leftx_current + margin
+            win_xrl, win_xrh = rightx_current - margin, rightx_current + margin
+            cv.rectangle(out_img, (win_xll, win_yl), (win_xlh, win_yh), (0, 255, 0), 2)
+            cv.rectangle(out_img, (win_xrl, win_yl), (win_xrh, win_yh), (0, 255, 0), 2)
+            good_left_inds = (
+                (nz[0] >= win_yl) & (nz[0] < win_yh) & (nz[1] >= win_xll) & (nz[1] < win_xlh)
+            ).nonzero()[0]
+            good_right_inds = (
+                (nz[0] >= win_yl) & (nz[0] < win_yh) & (nz[1] >= win_xrl) & (nz[1] < win_xrh)
+            ).nonzero()[0]
+            left_lane_inds.append(good_left_inds)
+            right_lane_inds.append(good_right_inds)
+            if len(good_left_inds) > minpix:
+                leftx_current = int(np.mean(nz[1][good_left_inds]))
+            if len(good_right_inds) > minpix:
+                rightx_current = int(np.mean(nz[1][good_right_inds]))
+        return np.concatenate(left_lane_inds), np.concatenate(right_lane_inds)
+
+    # ============================================================
+    #  슬라이딩 윈도우
+    # ============================================================
+    def sliding_window(self, img, n_windows=10, margin=16, minpix=5):
+        self._update_sticky_hold()
+        self.narrow_both_active = False
+        self.special_lane_debug = 'off'
+        self.center_bias_px = 0.0   # 기본 0, LAST_CURVE both에서만 우편향 설정
+        if self.behavior_phase == 'PERSON':
+            # PERSON: 기본 NORMAL 차선 로직 + 차선 중점을 왼쪽으로 오프셋(center_bias_px<0)
+            self.center_bias_px = -self.person_center_offset_px
+
+        y = img.shape[0]
+        nz = img.nonzero()
+        out_img = cv.cvtColor(img, cv.COLOR_GRAY2BGR)
+
+        use_topdown = (self._curve_lane_mode() and self.last_curve_topdown)
+        if use_topdown:
+            # LAST_CURVE: 위(먼 쪽)에서 아래로 진행 + 전용 윈도우 폭 사용
+            left_lane_inds, right_lane_inds = self._scan_top_down(
+                img, nz, out_img, n_windows, self.last_curve_window_margin, minpix)
+        else:
+            left_lane_inds, right_lane_inds = self._scan_bottom_up(
+                img, nz, out_img, n_windows, margin, minpix)
 
         candidates = []
         if len(left_lane_inds) >= self.min_lane_pixels:
@@ -524,7 +809,7 @@ class LaneFollow(Node):
             rfit = np.polyfit(nz[0][right_lane_inds], nz[1][right_lane_inds], 1)
             candidates.append((rfit, len(right_lane_inds), 'window_right'))
 
-        if car_follow:
+        if self.behavior_phase == 'CAR_FOLLOW':
             lfit, rfit = self._car_follow_lane_select(candidates, y, img)
         else:
             lfit, rfit = self._normal_lane_select(candidates, y, img.shape[1])
@@ -546,7 +831,8 @@ class LaneFollow(Node):
     # ============================================================
     #  디버그 오버레이
     # ============================================================
-    def draw_lane(self, image, warp_roi, warp_img0, inv_mat, left_fit, right_fit):
+    def draw_lane(self, image, warp_roi, warp_img0, inv_mat, left_fit, right_fit,
+                  tophat_removed=None):
         base_warp = warp_img0 if warp_img0 is not None else warp_roi
         full_h = base_warp.shape[0]
         roi_h = warp_roi.shape[0]
@@ -569,26 +855,68 @@ class LaneFollow(Node):
         newwarp = cv.warpPerspective(color_warp, inv_mat, (image.shape[1], image.shape[0]))
         result = cv.addWeighted(image, 1, newwarp, 0.3, 0)
 
+        # tophat이 제거한 픽셀을 원래 자리(원본 영상 좌표)에 빨간색으로 표시
+        if tophat_removed is not None:
+            removed_full = np.zeros(base_warp.shape[:2], dtype=np.uint8)
+            removed_full[roi_offset_y:roi_offset_y + roi_h, :] = tophat_removed
+            removed_unwarp = cv.warpPerspective(removed_full, inv_mat,
+                                                (image.shape[1], image.shape[0]))
+            result[removed_unwarp > 0] = (0, 0, 255)
+
         steer_deg = math.degrees(self.steer)
         cv.putText(result, f'yaw: {self.yaw:.3f} rad / steer: {steer_deg:.1f} deg / ang_z: {self.angular_velocity:.2f}',
                    (30, 40), cv.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv.LINE_AA)
-        cv.putText(result, f'err: {self.error:.1f} px / v: {self.cmd_speed:.2f}',
+        cv.putText(result, f'v: {self.final_cmd_speed:.2f} m/s',
+                   (30, 75), cv.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv.LINE_AA)
+        cv.putText(result, f'err: {self.error:.1f} px / stanley_v: {self.cmd_speed:.2f}',
                    (30, 110), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv.LINE_AA)
         cv.putText(result, f'lane: {self.last_lane_status}',
                    (30, 145), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2, cv.LINE_AA)
+
+        if self.last_lane_status == 'both':
+            cv.putText(result, f'both gap: {self.both_lane_gap_px:.0f} px',
+                       (30, 180), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv.LINE_AA)
 
         if self.narrow_both_active:
             cv.putText(result, f'narrow_both! gap={self.narrow_both_gap:.1f}px < {self.narrow_both_gap_px:.0f}px',
                        (30, 250), cv.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv.LINE_AA)
 
         phase_text = f'phase: {self.behavior_phase}'
-        if self.car_follow_latched:
+        if self.sticky_phase is not None:
             phase_text += ' (latched)'
+        if self.last_lane_triggered:
+            phase_text += ' | LAST_LANE!'
         cv.putText(result, phase_text, (30, 285), cv.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 2, cv.LINE_AA)
 
-        if self.behavior_phase == 'CAR_FOLLOW' or self.car_follow_lane_debug != 'off':
-            cv.putText(result, f'car_follow_lane: {self.car_follow_lane_debug}',
-                       (30, 320), cv.FONT_HERSHEY_SIMPLEX, 0.65, (255, 180, 80), 2, cv.LINE_AA)
+        if self.behavior_phase in ('CAR_FOLLOW', 'LAST_CURVE', 'PARKING') or self.special_lane_debug != 'off':
+            # 문장이 길어 화면에서 잘리므로 단어 단위로 줄바꿈해 여러 줄로 표시
+            full_text = f'special_lane: {self.special_lane_debug}'
+            wrap_len = 42
+            lines = []
+            cur = ''
+            for word in full_text.split(' '):
+                trial = word if not cur else f'{cur} {word}'
+                if len(trial) > wrap_len and cur:
+                    lines.append(cur)
+                    cur = word
+                else:
+                    cur = trial
+            if cur:
+                lines.append(cur)
+            for i, line in enumerate(lines):
+                cv.putText(result, line, (30, 320 + i * 30),
+                           cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 180, 80), 2, cv.LINE_AA)
+
+        # 주차 트리거(흰색 가로 정지선) 발동 시 상단에 눈에 띄는 배너 표시
+        if self.last_lane_triggered:
+            h, w = result.shape[:2]
+            overlay = result.copy()
+            cv.rectangle(overlay, (0, 0), (w, 70), (0, 0, 255), -1)
+            cv.addWeighted(overlay, 0.5, result, 0.5, 0, result)
+            banner = 'PARKING TRIGGER: STOP LINE DETECTED'
+            (tw, _), _ = cv.getTextSize(banner, cv.FONT_HERSHEY_SIMPLEX, 1.0, 3)
+            cv.putText(result, banner, ((w - tw) // 2, 48),
+                       cv.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3, cv.LINE_AA)
         return result
 
     # ============================================================
@@ -601,20 +929,27 @@ class LaneFollow(Node):
         self.warp_img0 = self.warpping(self.bgr)
         warp_roi = self.roi_set(self.warp_img0)
         g_filtered = self.gaussian_filter(warp_roi)
-        self.roi_img_pub.publish(self.cv_bridge.cv2_to_imgmsg(g_filtered, encoding='bgr8'))
+        self.roi_img_pub.publish(self.cv_bridge.cv2_to_imgmsg(self.warp_img0, encoding='bgr8'))
 
         hsv_binary = self.binary_filter(self.white_color_filter_hsv(g_filtered))
-        if self.tophat_enable:
-            self.filtered_img = cv.bitwise_and(hsv_binary, self.tophat_filter(g_filtered))
+        tophat_removed = None
+        # LAST_CURVE(및 이후 PARKING) 구간에서는 tophat 로직을 적용하지 않음
+        if self.tophat_enable and not self._curve_lane_mode():
+            tophat_mask = self.tophat_filter(g_filtered)
+            self.filtered_img = cv.bitwise_and(hsv_binary, tophat_mask)
+            # tophat으로 인해 지워진 픽셀(원래 흰색이었으나 tophat이 제거한 자리)
+            tophat_removed = cv.bitwise_and(hsv_binary, cv.bitwise_not(tophat_mask))
         else:
             self.filtered_img = hsv_binary
         self.binary_img_pub.publish(self.cv_bridge.cv2_to_imgmsg(self.filtered_img, encoding='mono8'))
 
+        self._update_last_lane_trigger(self.warp_img0)
         lfit, rfit = self.sliding_window(self.filtered_img)
         self.yaw, self.error = self.cal_center_line(lfit, rfit)
         self.cal_steering(self.yaw, self.error)
 
-        debug2_img = self.draw_lane(self.bgr, warp_roi, self.warp_img0, self.inv_warp_mat, lfit, rfit)
+        debug2_img = self.draw_lane(self.bgr, warp_roi, self.warp_img0, self.inv_warp_mat, lfit, rfit,
+                                    tophat_removed=tophat_removed)
         self.debug_publisher2.publish(self.cv_bridge.cv2_to_imgmsg(debug2_img, encoding='bgr8'))
 
 

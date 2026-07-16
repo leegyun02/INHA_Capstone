@@ -6,6 +6,7 @@ behavior_planner_node.py
 - 상태: WAITING_GREEN → DRIVING ↔ PERSON_STOP → PERSON_PASS → DRIVING
         DRIVING → CONE_APPROACH → CONE_W1 → CONE_ESCAPE → CONE_ESCAPE2 → DRIVING
         DRIVING → TUNNEL → DRIVING
+        DRIVING → FORCED_TURN → DRIVING   (하드코딩: 출발 후 일정 시간 뒤 강제 조향)
         DRIVING → PARKING_APPROACH → PARKING_REPLAY → PARKING_DONE (종료 상태)
 - Cone 미션 (Local Waypoint 기반):
     오도메트리 없이 라이다 상대 좌표만 사용.
@@ -16,6 +17,12 @@ behavior_planner_node.py
     CONE_ESCAPE_SEC 동안 주행.
     이어서 CONE_ESCAPE2: 반대로 한 번 더 꺾어 CONE_ESCAPE2_SEC 동안 유지(S자 정렬)
     한 뒤 DRIVING 복귀 → LAST_CURVE latch.
+- 강제 조향 미션 (하드코딩):
+    신호등이 녹색으로 바뀌어 출발한 순간(t=0)부터 FORCED_TURN_DELAY_SEC 경과 시,
+    DRIVING 중이면 FORCED_TURN 으로 전환해 FORCED_TURN_DUR_SEC 동안
+    (FORCED_TURN_SPEED, FORCED_TURN_W) 를 강제 발행한다. stanley 보다 우선순위가
+    위이지만 터널 로직보다는 아래이므로, 강제 조향 중이든 종료 후든 터널이 감지되면
+    즉시 TUNNEL 로직이 시작된다. 트리거는 코스당 한 번만 발동한다(forced_turn_done).
 - 평행주차 미션 (cmd_vel_record_replay_node.py 를 이 상태머신에 통합한 버전):
     my_test_stanley.py 가 가로 정지선(코스 마지막 구간)을 감지하면 /lane/last_lane_detected
     (std_msgs/Bool) 를 True로 발행한다. DRIVING 중 그 신호를 받으면 PARKING_APPROACH로
@@ -55,14 +62,23 @@ PUB_WAYPOINT_MARKER = '/behavior/waypoints'   # RViz 웨이포인트 (laser_link
 # (신호등 없이 테스트하려면 launch/CLI에서 enable_traffic_light:=False 로 끄면 됨)
 USE_TRAFFIC_START   = True
 
+# --- 강제 조향 (하드코딩: 출발 N초 뒤 강제로 꺾기) ---
+# 우선순위: 터널 > FORCED_TURN > stanley(일반 주행)
+# 출발(초록불로 DRIVING 진입) 시각을 t=0 으로 하여 DELAY 경과 시 1회 발동.
+FORCED_TURN_ENABLE    = False
+FORCED_TURN_DELAY_SEC = 21.5  # 출발 후 이 시간 경과 시 강제 조향 시작 [s]
+FORCED_TURN_DUR_SEC   = 5.0    # 강제 조향 유지 시간 [s]
+FORCED_TURN_SPEED     = 0.7    # 강제 조향 중 전진 속도 [m/s]
+FORCED_TURN_W         = -1.34 # 강제 조향 각속도 [rad/s] (음수=우회전, REP103)
+
 # --- 사람 정지 ---
 PERSON_ENABLE       = False   # 사람 정지 미션 On/Off (기본값, enable_person 파라미터로도 제어)
 PERSON_STOP_DIST    = 0.75
-PERSON_WAIT_SEC     = 2.3
+PERSON_WAIT_SEC     = 2.1
 PERSON_PASS_SEC     = 5.0
 
 # --- Car 추종 (속도 캡) ---
-CAR_GATE_LAT        = 0.6
+CAR_GATE_LAT        = 0.5
 CAR_STOP_DIST       = 0.2
 CAR_RESUME_DIST     = 0.3
 CAR_MID_DIST        = 0.60
@@ -110,13 +126,13 @@ TUNNEL_ENABLE       = True
 TUNNEL_GAIN         = 3.0
 TUNNEL_WMAX         = 3.0
 TUNNEL_SPEED        = 1.0
-TUNNEL_HOLD_SEC     = 1.5
+TUNNEL_HOLD_SEC     = 1.3 ##1.5
 # 터널 진입 후 이 시간[s] 동안은 터널 중점 조향을 하지 않고 기존 NORMAL(Stanley) 주행 유지.
 # 0이면 진입 즉시 중점 조향 시작 (기존 동작).
-TUNNEL_NORMAL_DELAY_SEC = 0.5
+TUNNEL_NORMAL_DELAY_SEC = 0.5 ## 0
 PRE_CAR_FOLLOW_SEC  = 4.0     # 터널 종료 직후 CAR_FOLLOW 유지 시간 [s]
 # 터널 중점 횡오프셋 [m].
-TUNNEL_CENTER_OFFSET = 0.0
+TUNNEL_CENTER_OFFSET = 0.0 ## 0.1
 
 # --- LAST_CURVE (테스트용) ---
 LAST_CURVE_TEST_TIMEOUT_SEC = 200.0   # LAST_CURVE 진입 후 이 시간 지나면 강제 NORMAL 복귀 [s]
@@ -151,6 +167,7 @@ class BehaviorPlannerNode(Node):
         #   - enable_cone          : 콘 갈림길 주행 미션
         #   - enable_tunnel        : 터널 주행 미션
         #   - enable_person        : 사람 정지 미션
+        #   - enable_forced_turn   : 강제 조향(하드코딩) 미션
         # ============================================================
         self.declare_parameter('debug', False)
         self.declare_parameter('enable_traffic_light', USE_TRAFFIC_START)
@@ -159,6 +176,7 @@ class BehaviorPlannerNode(Node):
         self.declare_parameter('enable_tunnel', TUNNEL_ENABLE)
         self.declare_parameter('enable_person', PERSON_ENABLE)
         self.declare_parameter('enable_parking', True)
+        self.declare_parameter('enable_forced_turn', FORCED_TURN_ENABLE)
         self.declare_parameter('tunnel_normal_delay_sec', TUNNEL_NORMAL_DELAY_SEC)
 
         self.debug             = bool(self.get_parameter('debug').value)
@@ -168,6 +186,7 @@ class BehaviorPlannerNode(Node):
         self.enable_tunnel     = bool(self.get_parameter('enable_tunnel').value)
         self.enable_person     = bool(self.get_parameter('enable_person').value)
         self.enable_parking    = bool(self.get_parameter('enable_parking').value)
+        self.enable_forced_turn = bool(self.get_parameter('enable_forced_turn').value)
         self.tunnel_normal_delay_sec = float(self.get_parameter('tunnel_normal_delay_sec').value)
 
         self.state = 'WAITING_GREEN' if self.use_traffic_start else 'DRIVING'
@@ -180,6 +199,10 @@ class BehaviorPlannerNode(Node):
 
         # 신호등
         self.green_seen = False
+
+        # 강제 조향 (하드코딩)
+        self.driving_start_t = None    # DRIVING(출발) 시작 시각 (t=0 기준)
+        self.forced_turn_done = False  # 강제 조향 1회성 발동 플래그
 
         # 사람 정지 (1회성): 한 번 발동하면 이후로는 사람 무시
         self.person_done = False
@@ -239,7 +262,8 @@ class BehaviorPlannerNode(Node):
             f'[MISSION] traffic_light={self.use_traffic_start} '
             f'car_follow={self.enable_car_follow} cone={self.enable_cone} '
             f'tunnel={self.enable_tunnel} person={self.enable_person} '
-            f'parking={self.enable_parking} debug={self.debug}'
+            f'parking={self.enable_parking} forced_turn={self.enable_forced_turn} '
+            f'debug={self.debug}'
         )
 
     def now_sec(self):
@@ -251,6 +275,7 @@ class BehaviorPlannerNode(Node):
         if msg.data == 'Green' and self.state == 'WAITING_GREEN':
             self.green_seen = True
             self.state = 'DRIVING'
+            self.driving_start_t = self.now_sec()   # 강제 조향 기준 t=0
             self.get_logger().info('🟢 Green Light → Driving')
 
     # ============================================================
@@ -339,7 +364,7 @@ class BehaviorPlannerNode(Node):
 
         self._update_car_follow(obstacles)
 
-        # 터널 진입 (최우선)
+        # 터널 진입 (최우선). FORCED_TURN 중이어도 터널이 보이면 즉시 TUNNEL 로 덮어씀.
         tunnel_active = any(o.get('class') == 'TunnelActive' for o in obstacles)
         if self.enable_tunnel:
             if tunnel_active and self.state != 'TUNNEL':
@@ -650,6 +675,25 @@ class BehaviorPlannerNode(Node):
         t = self.now_sec()
         out = Twist()
 
+        # 출발 시각 기록 (신호등 없이 바로 DRIVING으로 시작하는 경우 대비)
+        if self.driving_start_t is None and self.state == 'DRIVING':
+            self.driving_start_t = t
+
+        # 강제 조향 트리거: 출발 후 DELAY 경과 & DRIVING 중일 때 1회 발동
+        # (터널/콘/사람 미션 중이 아니라 DRIVING 상태에서만 발동. 터널은 여기서도 우선함:
+        #  터널이면 state != 'DRIVING' 이므로 이 트리거는 걸리지 않음)
+        if (self.enable_forced_turn and self.state == 'DRIVING'
+                and not self.forced_turn_done
+                and self.driving_start_t is not None
+                and (t - self.driving_start_t) >= FORCED_TURN_DELAY_SEC):
+            self.state = 'FORCED_TURN'
+            self.forced_turn_done = True
+            self.timer_target = t + FORCED_TURN_DUR_SEC
+            self.get_logger().warn(
+                f'🔩 강제 조향 시작 (출발 후 {t - self.driving_start_t:.1f}s): '
+                f'v={FORCED_TURN_SPEED}, w={FORCED_TURN_W}, {FORCED_TURN_DUR_SEC}s'
+            )
+
         if self.enable_parking and self.state == 'DRIVING' and self.last_lane_detected \
                 and self.last_curve_latched and not self.parking_triggered:
             self._start_parking_approach()
@@ -733,6 +777,19 @@ class BehaviorPlannerNode(Node):
             out.linear.x = TUNNEL_SPEED
             out.angular.z = clamp(TUNNEL_GAIN * self.tunnel_mid_y, -TUNNEL_WMAX, TUNNEL_WMAX)
             self.cmd_pub.publish(self._apply_car_cap(out))
+            return
+
+        # 강제 조향 (하드코딩): stanley 보다 위, 터널보다 아래.
+        # 터널은 obstacle_callback 에서 state='TUNNEL' 로 덮어써지므로 여기 도달 전에 가로챔.
+        if self.state == 'FORCED_TURN':
+            if t >= self.timer_target:
+                self.state = 'DRIVING'
+                self.get_logger().info('🔩 강제 조향 종료 → DRIVING')
+                self.cmd_pub.publish(self._apply_car_cap(ctrl_msg))
+                return
+            out.linear.x = FORCED_TURN_SPEED
+            out.angular.z = FORCED_TURN_W
+            self.cmd_pub.publish(out)
             return
 
         # Cone 접근: 중앙콘을 향해 조향, 속도는 stanley 그대로 (+car_cap)
@@ -819,6 +876,7 @@ class BehaviorPlannerNode(Node):
     #  phase 발행
     #    CONE_APPROACH / CONE_W1 / CONE_ESCAPE / CONE_ESCAPE2 -> CONE
     #    TUNNEL -> TUNNEL
+    #    FORCED_TURN -> FORCED_TURN
     #    그 외 -> PRE_CAR_FOLLOW창 / 앞차 / LAST_CURVE latch / NORMAL
     # ============================================================
     def _publish_phase(self):
@@ -830,6 +888,8 @@ class BehaviorPlannerNode(Node):
         elif self.state == 'TUNNEL':
             phase = 'TUNNEL'
             self._tunnel_was_active = True
+        elif self.state == 'FORCED_TURN':
+            phase = 'FORCED_TURN'
         else:
             if self._cone_was_active:
                 self.last_curve_latched = True
